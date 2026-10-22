@@ -4,6 +4,7 @@ import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ClientboundBlockEventPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundLevelEventPacket;
@@ -17,7 +18,9 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.piston.PistonBaseBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.PushReaction;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -90,6 +93,7 @@ public final class VisibilityFilters {
     public static void broadcastBlockEvent(final ServerLevel level, final BlockPos pos, final ClientboundBlockEventPacket packet) {
         final double range = 64.0;
         final BlockState state = level.getBlockState(pos);
+        final Direction pistonFacing = packet.getBlock() instanceof PistonBaseBlock && state.hasProperty(PistonBaseBlock.FACING) ? state.getValue(PistonBaseBlock.FACING) : null;
         for (final ServerPlayer player : level.getServer().getPlayerList().getPlayers()) {
             if (player.level() != level) {
                 continue;
@@ -97,10 +101,35 @@ public final class VisibilityFilters {
             final double dx = pos.getX() - player.getX();
             final double dy = pos.getY() - player.getY();
             final double dz = pos.getZ() - player.getZ();
-            if (dx * dx + dy * dy + dz * dz < range * range && !player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)) {
+            if (dx * dx + dy * dy + dz * dz < range * range && !player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)
+                // the client would push blocks it sees differently than the server, leaving ghost blocks. Without the
+                // event it just gets the resulting block updates, only the sliding animation is lost
+                && !(pistonFacing != null && player.canvas$visibility.mayDesyncPiston(level, pos, pistonFacing))) {
                 player.connection.send(packet);
             }
         }
+    }
+
+    /**
+     * How far from a piston blocks can be moved by it: 12 pushed blocks plus the head.
+     */
+    public static final int PISTON_REACH = 13;
+
+    /**
+     * Whether pistons treat the block like the stone it is disguised as (movable, not sticky, no block entity), see
+     * {@link PistonBaseBlock#isPushable}. Unloaded blocks don't.
+     */
+    public static boolean movesLikeStone(final ServerLevel level, final int x, final int y, final int z) {
+        final BlockPos pos = new BlockPos(x, y, z);
+        final BlockState state = level.getBlockStateIfLoaded(pos);
+        if (state == null) {
+            return false;
+        }
+        return !state.is(Blocks.OBSIDIAN) && !state.is(Blocks.CRYING_OBSIDIAN) && !state.is(Blocks.RESPAWN_ANCHOR)
+            && !state.is(Blocks.REINFORCED_DEEPSLATE) && !state.is(Blocks.PISTON) && !state.is(Blocks.STICKY_PISTON)
+            && !state.is(Blocks.SLIME_BLOCK) && !state.is(Blocks.HONEY_BLOCK)
+            && state.getPistonPushReaction() == PushReaction.PUSH_PULL && !state.hasBlockEntity()
+            && state.getDestroySpeed(level, pos) != -1.0F;
     }
 
     /**

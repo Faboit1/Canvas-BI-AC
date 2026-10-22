@@ -5,6 +5,9 @@ import io.canvasmc.canvas.anticheat.antiesp.EntityVisibility;
 import io.canvasmc.canvas.anticheat.antixray.RayTraceAntiXray;
 import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
+import io.canvasmc.canvas.anticheat.raytrace.OcclusionCache;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.server.level.ServerLevel;
@@ -58,6 +61,7 @@ public final class PlayerVisibility {
 
     // bypass permissions, refreshed periodically since permission checks aren't free
     private int nextPermissionRefresh = Integer.MIN_VALUE;
+    private volatile boolean reportedFailure;
     private boolean bypassAntiXray;
     private boolean bypassAntiEsp;
     private boolean bypassAntiFreecam;
@@ -106,7 +110,29 @@ public final class PlayerVisibility {
      */
     public static void tickPlayers(final ServerLevel level) {
         for (final ServerPlayer player : level.getLocalPlayers()) {
-            player.canvas$visibility.tick();
+            final PlayerVisibility visibility = player.canvas$visibility;
+            try {
+                visibility.tick();
+            } catch (final RuntimeException thrown) {
+                // an exception on a region thread would stop the server, start over for this player instead
+                visibility.failed("tick", thrown);
+                try {
+                    visibility.resetAll();
+                } catch (final RuntimeException ignored) {
+                    // reported above already
+                }
+            }
+        }
+    }
+
+    /**
+     * Reports an unexpected exception of a hook. The hooks fail open (as if the anticheat was off for the call), a
+     * bug in here must never take down a region thread. Only the first failure per player is logged in full.
+     */
+    private void failed(final String hook, final RuntimeException thrown) {
+        if (!this.reportedFailure) {
+            this.reportedFailure = true;
+            AnticheatExecutor.LOGGER.error("Visibility anticheat hook {} failed for player {}, further failures for this player are not logged", hook, this.player.getScoreboardName(), thrown);
         }
     }
 
@@ -176,6 +202,7 @@ public final class PlayerVisibility {
         } catch (final Throwable thrown) {
             AnticheatExecutor.LOGGER.error("Visibility job of {} failed for player {}", job.module.getClass().getSimpleName(), this.player.getScoreboardName(), thrown);
         } finally {
+            OcclusionCache.releaseCurrent();
             job.done = true;
         }
     }
@@ -296,37 +323,64 @@ public final class PlayerVisibility {
      * Creates the chunk packet sent to this player, with anti-freecam masking applied.
      */
     public ClientboundLevelChunkWithLightPacket createChunkPacket(final LevelChunk chunk, final boolean modifyBlocks) {
-        return this.antiFreecam.createChunkPacket(chunk, modifyBlocks && !this.bypassesAntiXray());
+        try {
+            return this.antiFreecam.createChunkPacket(chunk, modifyBlocks && !this.bypassesAntiXray());
+        } catch (final RuntimeException thrown) {
+            this.failed("createChunkPacket", thrown);
+            return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks);
+        }
     }
 
     /**
      * Called right after a chunk packet created by {@link #createChunkPacket} was queued for sending.
      */
     public void onChunkSent(final LevelChunk chunk, final ClientboundLevelChunkWithLightPacket packet) {
-        this.antiXray.onChunkSent(chunk, packet);
-        this.antiFreecam.onChunkSent(chunk, packet);
+        try {
+            this.antiXray.onChunkSent(chunk, packet);
+            this.antiFreecam.onChunkSent(chunk, packet);
+        } catch (final RuntimeException thrown) {
+            this.failed("onChunkSent", thrown);
+        }
     }
 
     /**
      * Called right before the client is told to forget a chunk.
      */
     public void onChunkUnload(final int chunkX, final int chunkZ) {
-        this.antiXray.onChunkUnload(chunkX, chunkZ);
-        this.antiFreecam.onChunkUnload(chunkX, chunkZ);
+        try {
+            this.antiXray.onChunkUnload(chunkX, chunkZ);
+            this.antiFreecam.onChunkUnload(chunkX, chunkZ);
+        } catch (final RuntimeException thrown) {
+            this.failed("onChunkUnload", thrown);
+        }
     }
 
     /**
      * Entity tracker check, called every tick for every entity in tracking range. Must be cheap.
      */
     public boolean canSee(final Entity entity) {
-        return !this.antiFreecam.isEntityMasked(entity) && this.antiEsp.canSee(entity);
+        if (entity.getRootVehicle() == this.player.getRootVehicle()) {
+            // the player's own vehicle and everyone riding along
+            return true;
+        }
+        try {
+            return !this.antiFreecam.isEntityMasked(entity) && this.antiEsp.canSee(entity);
+        } catch (final RuntimeException thrown) {
+            this.failed("canSee", thrown);
+            return true;
+        }
     }
 
     /**
      * Called by the player chunk loader before it sends a chunk, chunks that may not be sent yet stay queued.
      */
     public boolean mayChunkBeSent(final int chunkX, final int chunkZ) {
-        return this.antiFreecam.mayChunkBeSent(chunkX, chunkZ);
+        try {
+            return this.antiFreecam.mayChunkBeSent(chunkX, chunkZ);
+        } catch (final RuntimeException thrown) {
+            this.failed("mayChunkBeSent", thrown);
+            return true;
+        }
     }
 
     /**
@@ -340,7 +394,12 @@ public final class PlayerVisibility {
      * @param state the state that would be sent, for block entity data and block events the current state
      */
     public boolean isBlockHidden(final int x, final int y, final int z, final BlockState state) {
-        return this.antiXray.isHidden(x, y, z, state) || this.antiFreecam.isMasked(x, y, z);
+        try {
+            return this.antiXray.isHidden(x, y, z, state) || this.antiFreecam.isMasked(x, y, z);
+        } catch (final RuntimeException thrown) {
+            this.failed("isBlockHidden", thrown);
+            return false;
+        }
     }
 
     /**
@@ -348,7 +407,13 @@ public final class PlayerVisibility {
      * player. Same thread rules.
      */
     public boolean mayHideInSection(final int chunkX, final int sectionY, final int chunkZ) {
-        return this.antiFreecam.isSectionMasked(chunkX, sectionY, chunkZ) || this.antiXray.mayHideInSection(chunkX, sectionY, chunkZ);
+        try {
+            return this.antiFreecam.isSectionMasked(chunkX, sectionY, chunkZ) || this.antiXray.mayHideInSection(chunkX, sectionY, chunkZ);
+        } catch (final RuntimeException thrown) {
+            this.failed("mayHideInSection", thrown);
+            // isBlockHidden decides
+            return true;
+        }
     }
 
     /**
@@ -369,10 +434,59 @@ public final class PlayerVisibility {
      * player.
      */
     public boolean isEntityHidden(final Entity entity) {
-        if (entity == this.player) {
+        if (entity == this.player || entity.getRootVehicle() == this.player.getRootVehicle()) {
             return false;
         }
-        return this.antiFreecam.isEntityMasked(entity) || (this.isActive(this.antiEsp) && this.antiEsp.isHidden(entity));
+        try {
+            return this.antiFreecam.isEntityMasked(entity) || (this.isActive(this.antiEsp) && this.antiEsp.isHidden(entity));
+        } catch (final RuntimeException thrown) {
+            this.failed("isEntityHidden", thrown);
+            return false;
+        }
+    }
+
+    /**
+     * Whether the client could move blocks differently than the server if it played the piston event at the
+     * position: clients simulate pushes on their own view of the world, in which hidden blocks are stone and masked
+     * sections filler. Only hidden blocks within reach that pistons treat differently than stone matter, see
+     * {@link VisibilityFilters#movesLikeStone}. Same thread rules as {@link #isBlockHidden}, called on the region
+     * thread owning the piston.
+     */
+    public boolean mayDesyncPiston(final ServerLevel level, final BlockPos pos, final Direction facing) {
+        try {
+            final int reach = VisibilityFilters.PISTON_REACH;
+            final int x = pos.getX();
+            final int y = pos.getY();
+            final int z = pos.getZ();
+            // filler only matters in the corridor the piston pushes or pulls along: elsewhere it is part of a masked
+            // section, which is sent again as a whole once it can be seen
+            final int endX = x + facing.getStepX() * reach;
+            final int endY = y + facing.getStepY() * reach;
+            final int endZ = z + facing.getStepZ() * reach;
+            if (this.antiFreecam.anySectionMasked((Math.min(x, endX) - 1) >> 4, (Math.min(y, endY) - 1) >> 4, (Math.min(z, endZ) - 1) >> 4,
+                (Math.max(x, endX) + 1) >> 4, (Math.max(y, endY) + 1) >> 4, (Math.max(z, endZ) + 1) >> 4)) {
+                return true;
+            }
+            return this.antiXray.anyHidden(level, x - reach, y - reach, z - reach, x + reach, y + reach, z + reach,
+                (final int hiddenX, final int hiddenY, final int hiddenZ) -> !VisibilityFilters.movesLikeStone(level, hiddenX, hiddenY, hiddenZ));
+        } catch (final RuntimeException thrown) {
+            this.failed("mayDesyncPiston", thrown);
+            return false;
+        }
+    }
+
+    /**
+     * Whether the locator bar may get the exact position of the entity for this player. While anti-ESP is active, only
+     * entities the player can currently see may be located exactly, all others only get a direction. Called on the
+     * player's region thread.
+     */
+    public boolean mayLocateExactly(final Entity entity) {
+        try {
+            return !this.isActive(this.antiEsp) || !this.config().antiEsp.limitLocatorBar || this.antiEsp.isKnownVisible(entity);
+        } catch (final RuntimeException thrown) {
+            this.failed("mayLocateExactly", thrown);
+            return true;
+        }
     }
 
     /**
@@ -381,7 +495,12 @@ public final class PlayerVisibility {
      * @return the packet to send, which may be the given packet, a filtered copy, or {@code null} to send nothing
      */
     public @Nullable ClientboundLightUpdatePacket filterLightUpdate(final ClientboundLightUpdatePacket packet) {
-        return this.antiFreecam.filterLightUpdate(packet);
+        try {
+            return this.antiFreecam.filterLightUpdate(packet);
+        } catch (final RuntimeException thrown) {
+            this.failed("filterLightUpdate", thrown);
+            return packet;
+        }
     }
 
     /**
@@ -389,7 +508,11 @@ public final class PlayerVisibility {
      * before the client is told about the new position.
      */
     public void onTeleport() {
-        this.antiFreecam.onTeleport();
+        try {
+            this.antiFreecam.onTeleport();
+        } catch (final RuntimeException thrown) {
+            this.failed("onTeleport", thrown);
+        }
     }
 
     /**

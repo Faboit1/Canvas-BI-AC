@@ -186,6 +186,25 @@ public final class EntityVisibility implements VisibilityModule {
     }
 
     /**
+     * Whether the player's client currently has the entity because anti-ESP found it visible: its entry was refreshed
+     * by the entity tracker during the last tick and is visible. Entities outside tracking range aren't. Never changes
+     * any state.
+     */
+    public boolean isKnownVisible(final Entity entity) {
+        if (!this.passActive) {
+            return true;
+        }
+        final Entity root = entity.getRootVehicle();
+        if (root == this.owner.player.getRootVehicle()) {
+            return true;
+        }
+        final EntityTable table = this.table;
+        final int slot = table.find(root.getId());
+        return slot >= 0 && table.entity[slot] == root && this.pass - table.seen[slot] <= 1
+            && (table.always[slot] || table.state[slot] == EntityTable.VISIBLE);
+    }
+
+    /**
      * Entity tracker check, see the class documentation.
      */
     public boolean canSee(final Entity entity) {
@@ -320,7 +339,10 @@ public final class EntityVisibility implements VisibilityModule {
         }
         --this.syncBudget;
         final OcclusionCache cache = OcclusionCache.get(this.syncAccess(viewer), this.syncEyeX, this.syncEyeY, this.syncEyeZ);
-        final boolean visible = BoxOcclusion.isVisible(cache, this.syncCameras, this.syncCameraCount, table.box, offset, this.syncPoints);
+        // no grid points on the region thread: large boxes would cost hundreds of rays, a box only visible through a
+        // small gap is found by the worker right after
+        final boolean visible = BoxOcclusion.isVisible(cache, this.syncCameras, this.syncCameraCount, table.box, offset, this.syncPoints, false);
+        OcclusionCache.releaseCurrent();
         final int pass = this.pass;
         table.checked[slot] = pass;
         if (visible) {
