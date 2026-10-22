@@ -758,7 +758,8 @@ public class WorldConfig extends Part {
                         "player could possibly see. All other sections are sent as solid stone (and without light, block",
                         "entities or block updates), so moving the camera away from the body through walls reveals nothing.",
                         "Because the server's graph is always a superset of what the client renders, legit players never see",
-                        "the hidden sections"
+                        "the hidden sections. Sections at or above the surface of a chunk are always sent, they are open to",
+                        "the sky anyway, so only what lies underground is protected"
                     )
                 );
         }
@@ -777,7 +778,8 @@ public class WorldConfig extends Part {
                 option("updateIntervalTicks")
                     .docs(
                         "How often, in ticks, the occlusion graph of a player that doesn't move is checked for block changes",
-                        "that open up new lines of sight. Moving players and newly sent chunks are handled immediately"
+                        "that open up new lines of sight. Moving players, newly sent chunks and blocks changing between opaque",
+                        "and transparent are handled immediately, this is only a fallback"
                     ).greaterThan(0.0F);
             }
 

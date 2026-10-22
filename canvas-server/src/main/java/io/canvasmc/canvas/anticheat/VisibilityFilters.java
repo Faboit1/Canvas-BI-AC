@@ -1,5 +1,6 @@
 package io.canvasmc.canvas.anticheat;
 
+import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.core.BlockPos;
@@ -12,6 +13,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -158,6 +160,27 @@ public final class VisibilityFilters {
             return new ClientboundBlockUpdatePacket(pos, hideBlock(level, pos.getY()));
         }
         return new ClientboundBlockUpdatePacket(pos, state);
+    }
+
+    /**
+     * Called when a block changed between occluding and not occluding, which may change what players can potentially
+     * see. Players the chunk was sent to get their anti-freecam visibility checked soon, instead of at the next
+     * periodic update. Changes inside sections masked for a player are skipped, no view leads into those.
+     */
+    public static void onOpacityChange(final ServerLevel level, final BlockPos pos) {
+        if (!level.canvasConfig().anticheat.antiFreecam.enabled) {
+            return;
+        }
+        final int chunkX = pos.getX() >> 4;
+        final int sectionY = pos.getY() >> 4;
+        final int chunkZ = pos.getZ() >> 4;
+        final List<ServerPlayer> players = level.getChunkSource().chunkMap.getPlayers(new ChunkPos(chunkX, chunkZ), false);
+        for (int i = 0, len = players.size(); i < len; ++i) {
+            final FreecamGuard antiFreecam = players.get(i).canvas$visibility.antiFreecam;
+            if (!antiFreecam.isSectionMasked(chunkX, sectionY, chunkZ)) {
+                antiFreecam.onOpacityChange();
+            }
+        }
     }
 
     /**

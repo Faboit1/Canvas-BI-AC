@@ -21,6 +21,10 @@ import org.jspecify.annotations.Nullable;
  * Walking in and out of caves is debounced, but discontinuities (joining, changing worlds, respawning, teleporting)
  * are evaluated immediately, before any chunk is sent for the new position. While the data needed to decide is
  * missing the player is assumed to be underground, so reconnecting never sends the full view distance first.
+ * <p>
+ * Every change of the cap makes the client forget or receive a lot of chunks, so leaving the underground state
+ * needs a clearly shallower position than entering it (or sky light), a player walking through a cave right at the
+ * configured depth doesn't flip between the two.
  */
 public final class UndergroundViewDistance {
 
@@ -32,6 +36,11 @@ public final class UndergroundViewDistance {
      * Moving further than this between two evaluations is treated as a teleport.
      */
     private static final double DISCONTINUITY_DISTANCE_SQUARED = 16.0 * 16.0;
+    /**
+     * How many blocks shallower than the surface depth an underground player needs to get to count as on the
+     * surface again, unless the sky light reaches them.
+     */
+    private static final int EXIT_HYSTERESIS = 4;
 
     private final PlayerVisibility owner;
 
@@ -68,7 +77,7 @@ public final class UndergroundViewDistance {
         }
 
         final boolean discontinuity = this.isDiscontinuity();
-        final int now = this.evaluate(config);
+        final int now = this.evaluate(config, !discontinuity && !this.assumed && this.state == STATE_UNDERGROUND);
         if (this.state == STATE_UNKNOWN || discontinuity || (this.assumed && now != STATE_UNKNOWN)) {
             this.applyImmediately(now, config);
             return;
@@ -92,7 +101,7 @@ public final class UndergroundViewDistance {
         if (this.state == STATE_UNKNOWN || this.isDiscontinuity()) {
             final WorldConfig.Anticheat.UndergroundViewDistance config = this.owner.config().undergroundViewDistance;
             if (this.isActive(config)) {
-                this.applyImmediately(this.evaluate(config), config);
+                this.applyImmediately(this.evaluate(config, false), config);
             } else {
                 this.reset();
             }
@@ -131,7 +140,11 @@ public final class UndergroundViewDistance {
         this.cap = state == STATE_UNDERGROUND ? config.viewDistance : Integer.MAX_VALUE;
     }
 
-    private int evaluate(final WorldConfig.Anticheat.UndergroundViewDistance config) {
+    /**
+     * @param underground whether the player is underground and only moved continuously since, which makes leaving
+     *                    the underground state harder
+     */
+    private int evaluate(final WorldConfig.Anticheat.UndergroundViewDistance config, final boolean underground) {
         final ServerPlayer player = this.owner.player;
         final ServerLevel level = player.level();
         this.evaluatedLevel = level;
@@ -139,8 +152,9 @@ public final class UndergroundViewDistance {
         this.evaluatedY = player.getY();
         this.evaluatedZ = player.getZ();
 
-        if (level.dimensionType().hasCeiling()) {
-            // the heightmap of a roofed dimension is its ceiling, everything would count as underground
+        if (level.dimensionType().hasCeiling() || !level.dimensionType().hasSkyLight()) {
+            // the heightmap of a roofed dimension is its ceiling, everything would count as underground, and without
+            // sky light (the end) the light test can't tell caves from the space under an overhang
             return STATE_SURFACE;
         }
         if (player.isEyeInFluid(FluidTags.WATER)) {
@@ -157,7 +171,8 @@ public final class UndergroundViewDistance {
 
         final double eyeY = player.getEyeY();
         final int surface = chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-        if (eyeY + config.surfaceDepth > surface) {
+        final int depth = underground ? Math.max(0, config.surfaceDepth - EXIT_HYSTERESIS) : config.surfaceDepth;
+        if (eyeY + depth > surface) {
             return STATE_SURFACE;
         }
         return level.getBrightness(LightLayer.SKY, BlockPos.containing(player.getX(), eyeY, player.getZ())) > 0 ? STATE_SURFACE : STATE_UNDERGROUND;

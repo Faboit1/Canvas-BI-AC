@@ -9,6 +9,7 @@ import io.canvasmc.canvas.anticheat.CameraSnapshot;
 import io.canvasmc.canvas.anticheat.PlayerVisibility;
 import io.canvasmc.canvas.anticheat.VisibilityModule;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
+import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -23,6 +24,7 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
 import org.jspecify.annotations.Nullable;
 
@@ -36,12 +38,13 @@ import org.jspecify.annotations.Nullable;
  * of it ({@link OcclusionGraph}, {@link SectionVisibility}), from every camera position within
  * {@code reveal-margin} blocks of the eyes. Legit players therefore never get to see the filler.
  * <p>
- * A section is sent real if it is in the last computed potentially visible set (PVS), lies around the eyes, or was
- * sent real before (reveals are sticky until the client forgets the chunk, which avoids churn). Chunks are only sent
- * once a PVS covers them ({@link #mayChunkBeSent}), anything else that sends a chunk the PVS doesn't cover yet gets
- * everything outside the start box masked until it does. Whenever a new PVS contains masked sections,
- * their chunks are re-sent to this player, nearest first and rate limited. Block, block entity, block event and
- * light updates inside masked sections are dropped, since the re-sent chunk brings the current state anyway.
+ * A section is sent real if it is in the last computed potentially visible set (PVS), lies around the eyes, reaches
+ * the surface of its chunk (see {@link #surfaceSections}), or was sent real before (reveals are sticky until the
+ * client forgets the chunk, which avoids churn). Chunks are only sent once a PVS covers them
+ * ({@link #mayChunkBeSent}), for at most a second; anything that sends a chunk the PVS doesn't cover yet gets
+ * everything outside the start box masked until it does. Whenever a new PVS contains masked sections, their chunks
+ * are re-sent to this player, nearest first and rate limited. Block, block entity, block event and light updates
+ * inside masked sections are dropped, since the re-sent chunk brings the current state anyway.
  * <p>
  * Threading: everything runs on the player's region thread, except {@link #runAsync} (PVS computation on an
  * anticheat worker) and the leak filters {@link #isSectionMasked}, {@link #isMasked} and {@link #filterLightUpdate},
@@ -63,10 +66,27 @@ public final class FreecamGuard implements VisibilityModule {
      */
     private static final double MAX_LOOKAHEAD_SPEED = 3.0;
     /**
-     * Movement faster than this, in blocks per tick, is a teleport and gets no lookahead at all.
+     * Movement faster than this, in blocks per tick, is a teleport and gets no lookahead at all. Falling (3.9) and
+     * elytra flight (3.5) stay below it.
      */
-    private static final double TELEPORT_SPEED = 8.0;
+    private static final double TELEPORT_SPEED = 4.0;
     private static final int MAX_GRID_RADIUS = 127;
+    /**
+     * How long chunks are withheld at most while waiting for a PVS that covers them. After that they are sent with
+     * everything outside the start box masked and revealed once the PVS arrives, so a lagging worker pool can never
+     * keep a player from getting chunks.
+     */
+    private static final long MAX_WITHHOLD_NANOS = 1_000_000_000L;
+    private static final long NOT_WITHHOLDING = Long.MIN_VALUE;
+    /**
+     * Sections of a chunk that reach this quantile of its surface (the highest blocks of its columns, lowest first)
+     * are never masked, see {@link #surfaceSections}.
+     */
+    private static final int SURFACE_QUANTILE_COLUMN = 64;
+    /**
+     * Minimum ticks between two checks of the PVS requested by {@link #onOpacityChange}.
+     */
+    private static final int OPACITY_CHECK_INTERVAL = 2;
 
     private static final AtomicBoolean WARNED_HEIGHT = new AtomicBoolean();
     private static final ThreadLocal<Worker> WORKERS = ThreadLocal.withInitial(Worker::new);
@@ -82,17 +102,36 @@ public final class FreecamGuard implements VisibilityModule {
      * Written on the region thread only.
      */
     private volatile int maskedChunks;
+    /**
+     * Set by {@link #onOpacityChange} from any thread, requests a check of the PVS.
+     */
+    private volatile boolean opacityChanged;
 
     // region thread state
     private @Nullable Pvs current;
     private @Nullable Pvs spare;
     /**
-     * Bumped whenever the results of a running job become useless (teleports, resets).
+     * Bumped whenever the results of a running job become useless (resets).
      */
     private long generation;
     private boolean chunksChanged = true;
     private int lastJobTick;
     private boolean jobScheduled;
+    /**
+     * When chunks were first withheld for lack of a covering PVS since the last PVS was applied, or
+     * {@link #NOT_WITHHOLDING}.
+     */
+    private long withheldSince = NOT_WITHHOLDING;
+    /**
+     * Whether the reveal queue holds the chunks to unmask after the module was deactivated.
+     */
+    private boolean unmasking;
+    /**
+     * The camera distance of the last snapshot, or {@code NaN} before the first one.
+     */
+    private double cameraDistance = Double.NaN;
+    private @Nullable OcclusionAccess tickAccess;
+    private final int[] surfaceHeights = new int[16 * 16];
     /**
      * The start box of the last snapshot in section coordinates: min x, y, z, max x, y, z.
      */
@@ -186,15 +225,24 @@ public final class FreecamGuard implements VisibilityModule {
      * Working memory of a worker thread.
      */
     private static final class Worker implements OcclusionGraph.Sections {
+        private static final int UNRECORDED = Integer.MIN_VALUE;
+
         final OcclusionGraph graph = new OcclusionGraph();
         final SectionVisibility.Scratch scratch = new SectionVisibility.Scratch();
         LevelChunkSection[] @Nullable [] columns = new LevelChunkSection[0][];
+        int height;
+        /**
+         * Per section of the grid: the opacity version its visibility set was computed for while recording.
+         */
+        int[] versions = new int[0];
+        boolean recording;
 
         void load(final OcclusionAccess access, final Pvs pvs) {
             final int count = pvs.width * pvs.depth;
             if (this.columns.length < count) {
                 this.columns = new LevelChunkSection[count][];
             }
+            this.height = pvs.height;
             for (int z = 0; z < pvs.depth; ++z) {
                 for (int x = 0; x < pvs.width; ++x) {
                     final LevelChunkSection[] sections = access.sections(pvs.originX + x, pvs.originZ + z);
@@ -203,8 +251,24 @@ public final class FreecamGuard implements VisibilityModule {
             }
         }
 
+        /**
+         * Starts remembering the versions of the visibility sets read for the loaded grid, so the fingerprint of the
+         * result describes the blocks it was really computed from. Reading the versions afterwards would stamp a
+         * result computed from older blocks with the version of a change that happened in the meantime, and the
+         * change would never be noticed.
+         */
+        void startRecording(final Pvs pvs) {
+            final int nodes = pvs.width * pvs.depth * pvs.height;
+            if (this.versions.length < nodes) {
+                this.versions = new int[nodes];
+            }
+            Arrays.fill(this.versions, 0, nodes, UNRECORDED);
+            this.recording = true;
+        }
+
         void release() {
             Arrays.fill(this.columns, null);
+            this.recording = false;
         }
 
         long fingerprint(final Pvs pvs) {
@@ -216,7 +280,13 @@ public final class FreecamGuard implements VisibilityModule {
                     continue;
                 }
                 for (long visible = pvs.visible[column]; visible != 0L; visible &= visible - 1L) {
-                    hash = hash * 31L + SectionVisibility.version(sections[Long.numberOfTrailingZeros(visible)]);
+                    final int index = Long.numberOfTrailingZeros(visible);
+                    // start sections are left through every face, their contents never mattered
+                    int version = this.recording ? this.versions[column * this.height + index] : UNRECORDED;
+                    if (version == UNRECORDED) {
+                        version = SectionVisibility.version(sections[index]);
+                    }
+                    hash = hash * 31L + version;
                 }
             }
             return hash;
@@ -229,7 +299,12 @@ public final class FreecamGuard implements VisibilityModule {
 
         @Override
         public long visibility(final int column, final int sectionIndex) {
-            return SectionVisibility.get(this.columns[column][sectionIndex], this.scratch);
+            final LevelChunkSection section = this.columns[column][sectionIndex];
+            final int version = SectionVisibility.version(section);
+            if (this.recording) {
+                this.versions[column * this.height + sectionIndex] = version;
+            }
+            return SectionVisibility.get(section, this.scratch, version);
         }
     }
 
@@ -258,31 +333,61 @@ public final class FreecamGuard implements VisibilityModule {
         this.boxLevel = null;
         this.chunksChanged = true;
         this.jobScheduled = false;
+        this.withheldSince = NOT_WITHHOLDING;
+        this.revealQueueHead = 0;
         this.revealQueueSize = 0;
+        this.unmasking = false;
 
         final ServerPlayer player = this.owner.player;
         final ServerLevel level = player.level();
         final boolean active = this.isActive(this.owner.config());
         final LongArrayList stale = new LongArrayList();
-        final LongArrayList unmask = new LongArrayList();
+        final int centerX = player.chunkPosition().x();
+        final int centerZ = player.chunkPosition().z();
         for (final Iterator<SentChunk> iterator = this.sent.valueIterator(); iterator.hasNext(); ) {
             final SentChunk entry = iterator.next();
-            final long key = CoordinateUtils.getChunkKey(entry.chunk.getPos().x(), entry.chunk.getPos().z());
+            final int chunkX = entry.chunk.getPos().x();
+            final int chunkZ = entry.chunk.getPos().z();
             if (entry.chunk.getLevel() != level) {
-                stale.add(key);
+                stale.add(CoordinateUtils.getChunkKey(chunkX, chunkZ));
             } else if (!active && entry.masked != 0L) {
-                unmask.add(key);
+                this.enqueueReveal(chunkX, chunkZ, centerX, centerZ);
             }
         }
         for (int i = 0; i < stale.size(); ++i) {
             this.remove(stale.getLong(i));
         }
-        // the module stopped (bypass, spectator, disabled): give the client everything it is missing
-        for (int i = 0; i < unmask.size(); ++i) {
-            final SentChunk entry = this.sent.get(unmask.getLong(i));
-            if (entry != null) {
+        if (this.revealQueueSize != 0) {
+            // the module stopped (bypass, spectator, disabled): give the client everything it is missing, nearest
+            // first and spread over a few ticks
+            Arrays.sort(this.revealQueue, 0, this.revealQueueSize);
+            this.unmasking = true;
+        }
+    }
+
+    /**
+     * Re-sends the chunks that still have masked sections after the module was deactivated, rate limited. Chunks the
+     * client forgot in the meantime aren't in {@link #sent} anymore and are skipped.
+     */
+    @Override
+    public void tickInactive() {
+        if (!this.unmasking) {
+            return;
+        }
+        final int limit = 2 * this.owner.config().antiFreecam.maxResendsPerTick;
+        int sentNow = 0;
+        while (this.revealQueueHead < this.revealQueueSize && sentNow < limit) {
+            final long queued = this.revealQueue[this.revealQueueHead++];
+            final SentChunk entry = this.sent.get(CoordinateUtils.getChunkKey(unpackQueuedX(queued), unpackQueuedZ(queued)));
+            if (entry != null && entry.masked != 0L) {
                 this.resend(entry);
+                ++sentNow;
             }
+        }
+        if (this.revealQueueHead >= this.revealQueueSize) {
+            this.unmasking = false;
+            this.revealQueueHead = 0;
+            this.revealQueueSize = 0;
         }
     }
 
@@ -291,15 +396,45 @@ public final class FreecamGuard implements VisibilityModule {
      */
     @Override
     public void tick(final CameraSnapshot snapshot) {
+        if (this.unmasking) {
+            // reactivated before everything was unmasked, the chunks that are still masked stay tracked as such
+            this.unmasking = false;
+            this.revealQueueHead = 0;
+            this.revealQueueSize = 0;
+        }
         final WorldConfig.Anticheat.AntiFreecam config = this.owner.config().antiFreecam;
+        this.cameraDistance = snapshot.cameraDistance;
+        final double ahead = this.lookahead(snapshot);
         final double speed = Math.sqrt(snapshot.velocityX * snapshot.velocityX + snapshot.velocityY * snapshot.velocityY + snapshot.velocityZ * snapshot.velocityZ);
-        final double lookahead = speed > TELEPORT_SPEED ? 0.0 : LOOKAHEAD_TICKS * Math.min(1.0, MAX_LOOKAHEAD_SPEED / Math.max(speed, 1.0E-6));
+        final double scale = ahead == 0.0 ? 0.0 : ahead / speed;
         startBox(this.box, snapshot.level, snapshot.eyeX, snapshot.eyeY, snapshot.eyeZ, margin(config, snapshot.cameraDistance),
-            snapshot.velocityX * lookahead, snapshot.velocityY * lookahead, snapshot.velocityZ * lookahead);
+            snapshot.velocityX * scale, snapshot.velocityY * scale, snapshot.velocityZ * scale);
         this.boxLevel = snapshot.level;
 
         this.revealBox(this.box);
         this.processRevealQueue(config.maxResendsPerTick);
+    }
+
+    /**
+     * How far, in blocks, the start box reaches ahead of the eyes along the movement: the distance moved in
+     * {@link #LOOKAHEAD_TICKS}, but never past the first block in the way, since the player can't move through it.
+     * Sections behind walls must not become start sections, those are entered from every side.
+     */
+    private double lookahead(final CameraSnapshot snapshot) {
+        final double speed = Math.sqrt(snapshot.velocityX * snapshot.velocityX + snapshot.velocityY * snapshot.velocityY + snapshot.velocityZ * snapshot.velocityZ);
+        if (speed < 1.0E-3 || speed > TELEPORT_SPEED) {
+            return 0.0;
+        }
+        final double distance = LOOKAHEAD_TICKS * Math.min(speed, MAX_LOOKAHEAD_SPEED);
+        OcclusionAccess access = this.tickAccess;
+        if (access == null || access.level() != snapshot.level) {
+            this.tickAccess = access = new OcclusionAccess(snapshot.level);
+        }
+        if (access.isOpaque(Mth.floor(snapshot.eyeX), Mth.floor(snapshot.eyeY), Mth.floor(snapshot.eyeZ))) {
+            return 0.0;
+        }
+        return VoxelRaycaster.clipDistance(access, snapshot.eyeX, snapshot.eyeY, snapshot.eyeZ,
+            snapshot.velocityX / speed, snapshot.velocityY / speed, snapshot.velocityZ / speed, distance);
     }
 
     @Override
@@ -307,10 +442,13 @@ public final class FreecamGuard implements VisibilityModule {
         final WorldConfig.Anticheat.AntiFreecam config = this.owner.config().antiFreecam;
         final ServerLevel level = snapshot.level;
         final boolean boxChanged = !this.jobScheduled || !Arrays.equals(this.box, this.lastJobBox);
-        final boolean periodic = snapshot.tick - this.lastJobTick >= config.updateIntervalTicks || snapshot.tick < this.lastJobTick;
+        final int sinceLastJob = snapshot.tick - this.lastJobTick;
+        final boolean periodic = sinceLastJob >= config.updateIntervalTicks || sinceLastJob < 0
+            || (this.opacityChanged && sinceLastJob >= OPACITY_CHECK_INTERVAL);
         if (this.current != null && !boxChanged && !this.chunksChanged && !periodic) {
             return false;
         }
+        this.opacityChanged = false;
 
         final int sections = level.getSectionsCount();
         int radius = RegionizedPlayerChunkLoader.getAPISendViewDistance(this.owner.player);
@@ -356,6 +494,7 @@ public final class FreecamGuard implements VisibilityModule {
             }
             result.unchanged = false;
             worker.load(access, result);
+            worker.startRecording(result);
 
             final int[] box = this.jobBox;
             final int maxSectionY = result.minSectionY + result.height - 1;
@@ -390,6 +529,7 @@ public final class FreecamGuard implements VisibilityModule {
         }
         this.spare = this.current;
         this.current = result;
+        this.withheldSince = NOT_WITHHOLDING;
         this.queueReveals(result, Mth.floor(snapshot.eyeX) >> 4, Mth.floor(snapshot.eyeZ) >> 4);
     }
 
@@ -413,14 +553,29 @@ public final class FreecamGuard implements VisibilityModule {
             if (column < 0 || (masked & pvs.visible[column]) == 0L) {
                 continue;
             }
-            final long dx = chunkX - centerX;
-            final long dz = chunkZ - centerZ;
-            if (this.revealQueueSize == this.revealQueue.length) {
-                this.revealQueue = Arrays.copyOf(this.revealQueue, this.revealQueue.length * 2);
-            }
-            this.revealQueue[this.revealQueueSize++] = (dx * dx + dz * dz) << 44 | (chunkX & 0x3FFFFFL) << 22 | (chunkZ & 0x3FFFFFL);
+            this.enqueueReveal(chunkX, chunkZ, centerX, centerZ);
         }
         Arrays.sort(this.revealQueue, 0, this.revealQueueSize);
+    }
+
+    /**
+     * Appends a chunk to the reveal queue, keyed so that sorting orders the queue nearest first.
+     */
+    private void enqueueReveal(final int chunkX, final int chunkZ, final int centerX, final int centerZ) {
+        final long dx = chunkX - centerX;
+        final long dz = chunkZ - centerZ;
+        if (this.revealQueueSize == this.revealQueue.length) {
+            this.revealQueue = Arrays.copyOf(this.revealQueue, this.revealQueue.length * 2);
+        }
+        this.revealQueue[this.revealQueueSize++] = Math.min(dx * dx + dz * dz, 0x7FFFFL) << 44 | (chunkX & 0x3FFFFFL) << 22 | (chunkZ & 0x3FFFFFL);
+    }
+
+    private static int unpackQueuedX(final long queued) {
+        return (int) (queued << 20 >> 42);
+    }
+
+    private static int unpackQueuedZ(final long queued) {
+        return (int) (queued << 42 >> 42);
     }
 
     private void processRevealQueue(final int limit) {
@@ -428,8 +583,8 @@ public final class FreecamGuard implements VisibilityModule {
         int sentNow = 0;
         while (this.revealQueueHead < this.revealQueueSize && sentNow < limit) {
             final long queued = this.revealQueue[this.revealQueueHead++];
-            final int chunkX = (int) (queued << 20 >> 42);
-            final int chunkZ = (int) (queued << 42 >> 42);
+            final int chunkX = unpackQueuedX(queued);
+            final int chunkZ = unpackQueuedZ(queued);
             final SentChunk entry = this.sent.get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
             if (entry == null || pvs == null) {
                 continue;
@@ -502,8 +657,10 @@ public final class FreecamGuard implements VisibilityModule {
 
     private void currentBox(final int[] out) {
         final ServerPlayer player = this.owner.player;
+        // before the first snapshot only the attribute is known, the snapshot also accounts for scale and vehicles
+        final double cameraDistance = Double.isNaN(this.cameraDistance) ? player.getAttributeValue(Attributes.CAMERA_DISTANCE) : this.cameraDistance;
         startBox(out, player.level(), player.getX(), player.getEyeY(), player.getZ(),
-            margin(this.owner.config().antiFreecam, player.getAttributeValue(Attributes.CAMERA_DISTANCE)), 0.0, 0.0, 0.0);
+            margin(this.owner.config().antiFreecam, cameraDistance), 0.0, 0.0, 0.0);
     }
 
     private static long boxMask(final int[] box, final int chunkX, final int chunkZ, final int minSectionY, final int sections) {
@@ -543,6 +700,8 @@ public final class FreecamGuard implements VisibilityModule {
             real |= boxMask(this.box, chunkX, chunkZ, minSectionY, sections);
         }
 
+        real |= this.surfaceSections(chunk);
+
         final Pvs pvs = this.current;
         final int column = pvs == null || pvs.level != chunk.getLevel() ? -1 : pvs.column(chunkX, chunkZ);
         if (column >= 0) {
@@ -554,6 +713,38 @@ public final class FreecamGuard implements VisibilityModule {
 
         final long all = sections == 64 ? -1L : (1L << sections) - 1L;
         return all & ~real;
+    }
+
+    /**
+     * Sections at or above the surface of the chunk are never masked. They are open to the sky, so a player on the
+     * surface gets them through the PVS anyway, while masking them for players underground would put filler into
+     * the sky and the landscape they see when they come out of a cave. Only sections that lie below the highest
+     * block of most columns can be masked.
+     * <p>
+     * A quantile of the column heights is used instead of the lowest column, so a single shaft or pit doesn't
+     * unmask the rooms next to it.
+     */
+    private long surfaceSections(final LevelChunk chunk) {
+        final Heightmap heightmap = chunk.heightmaps.get(Heightmap.Types.WORLD_SURFACE);
+        if (heightmap == null) {
+            return 0L;
+        }
+        final int[] heights = this.surfaceHeights;
+        for (int z = 0; z < 16; ++z) {
+            for (int x = 0; x < 16; ++x) {
+                heights[z << 4 | x] = heightmap.getHighestTaken(x, z);
+            }
+        }
+        Arrays.sort(heights);
+        final int surface = heights[SURFACE_QUANTILE_COLUMN];
+        // the section containing the surface block and every section above it
+        final int from = Math.max(0, (surface >> 4) - chunk.getMinSectionY());
+        final int sections = chunk.getSectionsCount();
+        if (from >= sections) {
+            return 0L;
+        }
+        final long all = sections == 64 ? -1L : (1L << sections) - 1L;
+        return all & (-1L << from);
     }
 
     public void onChunkSent(final LevelChunk chunk, final ClientboundLevelChunkWithLightPacket packet) {
@@ -598,7 +789,13 @@ public final class FreecamGuard implements VisibilityModule {
             return true;
         }
         this.chunksChanged = true;
-        return false;
+        final long now = System.nanoTime();
+        if (this.withheldSince == NOT_WITHHOLDING) {
+            this.withheldSince = now;
+            return false;
+        }
+        // no PVS arrived in time, send it fail closed (masked outside the start box) and reveal it later
+        return now - this.withheldSince > MAX_WITHHOLD_NANOS;
     }
 
     private void setMasked(final SentChunk entry, final long masked) {
@@ -617,19 +814,29 @@ public final class FreecamGuard implements VisibilityModule {
 
     /**
      * Called right before the client is told about a new position: reveals the destination synchronously, so the
-     * client never stands inside filler, and discards the PVS of the old position.
+     * client never stands inside filler. The PVS of the old position and a job computing one stay valid: they only
+     * reveal what the player could see a moment ago, and chunks they don't cover are withheld or masked until the
+     * PVS of the new position arrives (the start box changed, so it is computed right away). Throwing them away
+     * instead would keep players that are teleported every tick (freeze plugins, movement corrections) from ever
+     * getting a PVS, and with it any chunk.
      */
     public void onTeleport() {
-        if (this.maskedChunks == 0 && this.current == null) {
+        if (this.maskedChunks == 0) {
             return;
         }
-        ++this.generation;
-        this.current = null;
-        this.boxLevel = null;
-        this.revealQueueSize = 0;
-        this.revealQueueHead = 0;
         this.currentBox(this.teleportBox);
         this.revealBox(this.teleportBox);
+    }
+
+    /**
+     * Called when a block of a chunk sent to the player changed between opaque and not opaque, which may change what
+     * is potentially visible. May be called from any thread. Requests a check of the PVS within a few ticks instead
+     * of at the next periodic update, the check itself is cheap when the change doesn't matter.
+     */
+    public void onOpacityChange() {
+        if (!this.opacityChanged) {
+            this.opacityChanged = true;
+        }
     }
 
     // leak filters, callable from any thread

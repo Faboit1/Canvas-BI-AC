@@ -476,7 +476,7 @@ index af741fa730b7364e8d50fa838b9e761549f7df11..2cd62118280ca21e05a4731a7fca7b68
          }
  
 diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-index 63db562fe485987a66a91d20d5f81d8549a8f991..6cc0bca2e021a4493f6d6df34a1d280329c63948 100644
+index 63db562fe485987a66a91d20d5f81d8549a8f991..8bf70e20f603ffdadb20c33f33ae766db2e730e6 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
 @@ -1884,6 +1884,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
@@ -504,7 +504,19 @@ index 63db562fe485987a66a91d20d5f81d8549a8f991..6cc0bca2e021a4493f6d6df34a1d2803
          this.server
              .getPlayerList()
              .broadcast(
-@@ -2200,17 +2211,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -2000,6 +2011,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         }
+ 
+         this.getChunkSource().blockChanged(pos);
++        // Canvas start - visibility anticheat - anti-freecam
++        if (old.isSolidRender() != current.isSolidRender()) {
++            io.canvasmc.canvas.anticheat.VisibilityFilters.onOpacityChange(this, pos);
++        }
++        // Canvas end - visibility anticheat - anti-freecam
+         regionizedWorldData.pathTypesByPosCache.invalidate(pos); // Folia - region threading
+         if (this.paperConfig().misc.updatePathfindingOnBlockUpdate) { // Paper - option to disable pathfinding updates
+         VoxelShape oldShape = old.getCollisionShape(this, pos);
+@@ -2200,17 +2216,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          // Folia end - region threading
              if (this.shouldTickBlocksAt(eventData.pos())) {
                  if (this.doBlockEvent(eventData)) {

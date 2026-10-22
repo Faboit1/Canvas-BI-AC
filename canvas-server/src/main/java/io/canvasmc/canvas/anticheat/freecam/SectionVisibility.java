@@ -165,7 +165,16 @@ public final class SectionVisibility {
      * computed. May be called from any thread.
      */
     public static long get(final LevelChunkSection section, final Scratch scratch) {
-        final long stamp = (version(section) & VERSION_MASK) | STAMP_VALID;
+        return get(section, scratch, version(section));
+    }
+
+    /**
+     * Same as {@link #get(LevelChunkSection, Scratch)}, for a version the caller read with {@link #version} right
+     * before. The returned set reflects the blocks of at least that version, so a caller that remembers the version
+     * notices any later change by comparing it with the current one.
+     */
+    public static long get(final LevelChunkSection section, final Scratch scratch, final int version) {
+        final long stamp = (version & VERSION_MASK) | STAMP_VALID;
         final long cached = section.canvas$visibility;
         if (cached >>> STAMP_SHIFT == stamp) {
             return cached & ALL;
