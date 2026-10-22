@@ -57,6 +57,14 @@ public final class OcclusionCache implements BlockOcclusion {
         return cache;
     }
 
+    /**
+     * Drops the reference to the access of the current thread's cache, so it doesn't keep the level loaded once the
+     * pass is over.
+     */
+    public static void releaseCurrent() {
+        CACHES.get().access = null;
+    }
+
     private void begin(final OcclusionAccess access, final double cameraX, final double cameraY, final double cameraZ) {
         if (++this.generation > MAX_GENERATION) {
             Arrays.fill(this.cells, (byte) 0);

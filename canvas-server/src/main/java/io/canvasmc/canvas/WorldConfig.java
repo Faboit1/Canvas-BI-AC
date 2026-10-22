@@ -698,6 +698,12 @@ public class WorldConfig extends Part {
                         "How many ticks an entity stays visible after the line of sight to it was lost. Prevents flickering",
                         "at corners and makes peeking behave smoothly"
                     ).greaterThanOrEqualTo(0.0F);
+                option("limitLocatorBar")
+                    .docs(
+                        "Whether the locator bar only gets the exact position of players (and other waypoint transmitting",
+                        "entities) the player can currently see, and only their direction otherwise. Without this the locator",
+                        "bar works as a radar for hidden players and everyone within view distance"
+                    );
                 option("excludedEntityTypes")
                     .docs(
                         "Entity types that are never hidden, for example \"minecraft:armor_stand\". Bosses, lightning, end",
@@ -715,6 +721,7 @@ public class WorldConfig extends Part {
             public boolean hideProjectiles = false;
             public int visibleRecheckIntervalTicks = 4;
             public int hideGraceTicks = 10;
+            public boolean limitLocatorBar = true;
             public List<String> excludedEntityTypes = new ArrayList<>();
 
             private final java.util.concurrent.atomic.AtomicReference<java.util.@Nullable Set<EntityType<?>>> excludedEntityTypesCache = new java.util.concurrent.atomic.AtomicReference<>();

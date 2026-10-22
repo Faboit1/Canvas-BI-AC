@@ -45,11 +45,20 @@ final class BoxOcclusion {
      */
     static boolean isVisible(final OcclusionCache cache, final double[] cameras, final int cameraCount,
                              final double[] boxes, final int boxOffset, final double[] points) {
+        return isVisible(cache, cameras, cameraCount, boxes, boxOffset, points, true);
+    }
+
+    /**
+     * @param grid whether large boxes get the grid points on their faces. Without them at most 9 rays per camera are
+     *             traced, but a large box only visible through a small gap may be reported as hidden
+     */
+    static boolean isVisible(final OcclusionCache cache, final double[] cameras, final int cameraCount,
+                             final double[] boxes, final int boxOffset, final double[] points, final boolean grid) {
         for (int camera = 0; camera < cameraCount; ++camera) {
             final double camX = cameras[camera * 3];
             final double camY = cameras[camera * 3 + 1];
             final double camZ = cameras[camera * 3 + 2];
-            final int count = sample(camX, camY, camZ, boxes, boxOffset, points);
+            final int count = sample(camX, camY, camZ, boxes, boxOffset, points, grid);
             if (count < 0) {
                 return true;
             }
@@ -69,6 +78,11 @@ final class BoxOcclusion {
      */
     static int sample(final double camX, final double camY, final double camZ,
                       final double[] boxes, final int boxOffset, final double[] out) {
+        return sample(camX, camY, camZ, boxes, boxOffset, out, true);
+    }
+
+    static int sample(final double camX, final double camY, final double camZ,
+                      final double[] boxes, final int boxOffset, final double[] out, final boolean grid) {
         final double minX = boxes[boxOffset];
         final double minY = boxes[boxOffset + 1];
         final double minZ = boxes[boxOffset + 2];
@@ -112,7 +126,7 @@ final class BoxOcclusion {
         final double extentX = maxX - minX;
         final double extentY = maxY - minY;
         final double extentZ = maxZ - minZ;
-        if (extentX <= GRID_THRESHOLD && extentY <= GRID_THRESHOLD && extentZ <= GRID_THRESHOLD) {
+        if (!grid || extentX <= GRID_THRESHOLD && extentY <= GRID_THRESHOLD && extentZ <= GRID_THRESHOLD) {
             return count;
         }
 

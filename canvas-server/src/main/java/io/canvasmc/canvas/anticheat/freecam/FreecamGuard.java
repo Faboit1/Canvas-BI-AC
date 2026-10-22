@@ -86,7 +86,7 @@ public final class FreecamGuard implements VisibilityModule {
     /**
      * Minimum ticks between two checks of the PVS requested by {@link #onOpacityChange}.
      */
-    private static final int OPACITY_CHECK_INTERVAL = 2;
+    private static final int OPACITY_CHECK_INTERVAL = 5;
 
     private static final AtomicBoolean WARNED_HEIGHT = new AtomicBoolean();
     private static final ThreadLocal<Worker> WORKERS = ThreadLocal.withInitial(Worker::new);
@@ -842,6 +842,27 @@ public final class FreecamGuard implements VisibilityModule {
     // leak filters, callable from any thread
 
     /**
+     * Whether any section in the given range (section coordinates, inclusive) is filler for the client. Same thread
+     * rules as {@link #isSectionMasked}.
+     */
+    public boolean anySectionMasked(final int minChunkX, final int minSectionY, final int minChunkZ,
+                                    final int maxChunkX, final int maxSectionY, final int maxChunkZ) {
+        if (this.maskedChunks == 0) {
+            return false;
+        }
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ) {
+                for (int sectionY = minSectionY; sectionY <= maxSectionY; ++sectionY) {
+                    if (this.isSectionMasked(chunkX, sectionY, chunkZ)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * Whether the client currently has the given chunk section as filler. May be called from any thread, the answer
      * may then be slightly stale.
      *
@@ -864,7 +885,9 @@ public final class FreecamGuard implements VisibilityModule {
      * visible either. Glowing entities are excluded, the client renders their outline through anything.
      */
     public boolean isEntityMasked(final Entity entity) {
-        if (this.maskedChunks == 0 || entity.isCurrentlyGlowing()) {
+        if (this.maskedChunks == 0 || entity.isCurrentlyGlowing()
+            || entity instanceof net.minecraft.world.entity.boss.wither.WitherBoss || entity instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragon) {
+            // bosses show a boss bar while tracked, it would flicker
             return false;
         }
         final AABB box = entity.getBoundingBox();

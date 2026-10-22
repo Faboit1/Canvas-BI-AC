@@ -196,16 +196,8 @@ public final class RayTraceAntiXray implements VisibilityModule {
                 // the client forgot the chunk
                 continue;
             }
-            if (info != null) {
-                final int[] positions = info.getRayTraceHidden();
-                if (positions != null) {
-                    for (final int packed : positions) {
-                        this.sendRealState(chunk, tracked.blockPos(packed));
-                    }
-                    budget -= positions.length;
-                }
-                continue;
-            }
+            // takes the positions from the ready packet, and sends updates that were withheld while it was obfuscated
+            this.tryExtract(tracked);
             final int[] positions = tracked.positions;
             final long[] hidden = tracked.hidden;
             for (int i = 0; i < positions.length; ++i) {
@@ -382,6 +374,49 @@ public final class RayTraceAntiXray implements VisibilityModule {
     public boolean mayHideInSection(final int chunkX, final int sectionY, final int chunkZ) {
         final TrackedChunk tracked = this.chunks.get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
         return tracked != null && (tracked.info != null || tracked.mayHideInSection(sectionY - tracked.minSectionY));
+    }
+
+    @FunctionalInterface
+    public interface PositionFilter {
+        boolean test(int x, int y, int z);
+    }
+
+    /**
+     * Whether a block in the box is currently hidden from the player and matches the filter. Same thread rules as
+     * {@link #isHidden}. Chunks whose packet is still being obfuscated count as matching, their positions aren't
+     * known yet.
+     */
+    public boolean anyHidden(final ServerLevel level, final int minX, final int minY, final int minZ,
+                             final int maxX, final int maxY, final int maxZ, final PositionFilter filter) {
+        for (int chunkX = minX >> 4; chunkX <= maxX >> 4; ++chunkX) {
+            for (int chunkZ = minZ >> 4; chunkZ <= maxZ >> 4; ++chunkZ) {
+                final TrackedChunk tracked = this.chunks.get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
+                if (tracked == null || tracked.level != level) {
+                    continue;
+                }
+                if (tracked.info != null) {
+                    return true;
+                }
+                if (!tracked.mayHideInSections((minY >> 4) - tracked.minSectionY, (maxY >> 4) - tracked.minSectionY)) {
+                    continue;
+                }
+                final int[] positions = tracked.positions;
+                final long[] hidden = tracked.hidden;
+                for (int i = 0; i < positions.length; ++i) {
+                    if ((hidden[i >>> 6] & 1L << i) == 0L) {
+                        continue;
+                    }
+                    final int packed = positions[i];
+                    final int y = RayTraceObfuscation.unpackY(packed);
+                    final int x = tracked.blockX(packed);
+                    final int z = tracked.blockZ(packed);
+                    if (y >= minY && y <= maxY && x >= minX && x <= maxX && z >= minZ && z <= maxZ && filter.test(x, y, z)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     // visibility passes
@@ -751,6 +786,15 @@ public final class RayTraceAntiXray implements VisibilityModule {
 
         static long sectionBit(final int sectionIndex) {
             return sectionIndex >= 0 && sectionIndex < Long.SIZE ? 1L << sectionIndex : 0L;
+        }
+
+        boolean mayHideInSections(final int fromSectionIndex, final int toSectionIndex) {
+            for (int sectionIndex = fromSectionIndex; sectionIndex <= toSectionIndex; ++sectionIndex) {
+                if (this.mayHideInSection(sectionIndex)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         boolean mayHideInSection(final int sectionIndex) {

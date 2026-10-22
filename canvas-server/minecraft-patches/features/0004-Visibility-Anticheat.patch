@@ -666,10 +666,25 @@ index 196c01fe5f200ed57e6f23e0939cac616305571a..a0f573b298724ccba1fc806df50ee570
          // Paper start - PlayerChunkLoadEvent
          if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index c93d531dae987137c77357d16af07085c3057665..c2e9dc7957f4c8e541b20208327080eddbb4430c 100644
+index c93d531dae987137c77357d16af07085c3057665..04c643fe843007673ee2542fb5953175ea77a76a 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-@@ -2059,6 +2059,7 @@ public class ServerGamePacketListenerImpl
+@@ -1124,7 +1124,13 @@ public class ServerGamePacketListenerImpl
+         if (this.player.isWithinBlockInteractionRange(pos, 1.0)) {
+             if (level.isLoaded(pos)) {
+                 BlockState blockState = level.getBlockState(pos);
+-                boolean includeData = this.player.hasInfiniteMaterials() && packet.includeData();
++                // Canvas start - visibility anticheat - pick the block the player sees, hidden blocks can't be probed
++                final boolean hidden = this.player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), blockState);
++                if (hidden) {
++                    blockState = io.canvasmc.canvas.anticheat.VisibilityFilters.hideBlock(level, pos.getY());
++                }
++                boolean includeData = !hidden && this.player.hasInfiniteMaterials() && packet.includeData();
++                // Canvas end - visibility anticheat
+                 ItemStack itemStack = blockState.getCloneItemStack(level, pos, includeData);
+                 if (!itemStack.isEmpty()) {
+                     if (includeData && this.player.getBukkitEntity().hasPermission("minecraft.nbt.copy")) { // Spigot
+@@ -2059,6 +2065,7 @@ public class ServerGamePacketListenerImpl
          this.lastYRot = this.player.getYRot();
          this.lastXRot = this.player.getXRot();
          // CraftBukkit end
@@ -677,7 +692,7 @@ index c93d531dae987137c77357d16af07085c3057665..c2e9dc7957f4c8e541b20208327080ed
          this.send(ClientboundPlayerPositionPacket.of(this.awaitingTeleport, destination, relatives));
      }
  
-@@ -2298,8 +2299,10 @@ public class ServerGamePacketListenerImpl
+@@ -2298,8 +2305,10 @@ public class ServerGamePacketListenerImpl
                                  // this.player.sendBuildLimitMessage(true, maxY); // Paper - Fix MC-306582: Fix build limit message being sent when it shouldn't be
                              }
  
@@ -731,6 +746,19 @@ index 1bded76bb6efba6c31a273fdc6cafbcfb132bc38..44d0976970df0c3eb71133649db8c9ea
      }
      // Paper end
  
+diff --git a/net/minecraft/world/entity/LivingEntity.java b/net/minecraft/world/entity/LivingEntity.java
+index 33dc433b5955cc7bace1457189ddf83547eca494..3a06a12a7bef7dad9cb633145408704249b9ec4a 100644
+--- a/net/minecraft/world/entity/LivingEntity.java
++++ b/net/minecraft/world/entity/LivingEntity.java
+@@ -4977,7 +4977,7 @@ public abstract class LivingEntity extends Entity implements Attackable, Waypoin
+             return Optional.empty();
+         } else {
+             Waypoint.Icon icon = this.locatorBarIcon.cloneAndAssignStyle(this);
+-            if (WaypointTransmitter.isReallyFar(this, player)) {
++            if (WaypointTransmitter.isReallyFar(this, player) || !player.canvas$visibility.mayLocateExactly(this)) { // Canvas - visibility anticheat - only the direction of entities hidden by anti-ESP
+                 return Optional.of(new WaypointTransmitter.EntityAzimuthConnection(this, icon, player));
+             } else {
+                 return !WaypointTransmitter.isChunkVisible(this.chunkPosition(), player)
 diff --git a/net/minecraft/world/entity/player/Player.java b/net/minecraft/world/entity/player/Player.java
 index 16b42374e32aa2d54237f035757aedbc37c57fcc..66582faed53883a49592ed304156be2db94e510a 100644
 --- a/net/minecraft/world/entity/player/Player.java
@@ -782,3 +810,45 @@ index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..5cff9939b03fa3812023aaa65230c039
      }
  
      public PalettedContainer<BlockState> getStates() {
+diff --git a/net/minecraft/world/waypoints/WaypointTransmitter.java b/net/minecraft/world/waypoints/WaypointTransmitter.java
+index 654d48de383eefbb489a810b83a02dff0c8887c5..d065292ca27cc5fdbdadb9dc25bd2acfd155e3d0 100644
+--- a/net/minecraft/world/waypoints/WaypointTransmitter.java
++++ b/net/minecraft/world/waypoints/WaypointTransmitter.java
+@@ -106,8 +106,15 @@ public interface WaypointTransmitter extends Waypoint {
+ 
+         @Override
+         public boolean isBroken() {
+-            return WaypointTransmitter.doesSourceIgnoreReceiver(this.source, this.receiver)
+-                || WaypointTransmitter.isChunkVisible(this.source.chunkPosition(), this.receiver)
++            // Canvas start - visibility anticheat - entities hidden by anti-ESP keep a direction only
++            if (WaypointTransmitter.doesSourceIgnoreReceiver(this.source, this.receiver)) {
++                return true;
++            }
++            if (!this.receiver.canvas$visibility.mayLocateExactly(this.source)) {
++                return false;
++            }
++            // Canvas end - visibility anticheat
++            return WaypointTransmitter.isChunkVisible(this.source.chunkPosition(), this.receiver)
+                 || !WaypointTransmitter.isReallyFar(this.source, this.receiver);
+         }
+ 
+@@ -171,7 +178,8 @@ public interface WaypointTransmitter extends Waypoint {
+ 
+         @Override
+         public boolean isBroken() {
+-            return WaypointTransmitter.BlockConnection.super.isBroken() || WaypointTransmitter.doesSourceIgnoreReceiver(this.source, this.receiver);
++            return WaypointTransmitter.BlockConnection.super.isBroken() || WaypointTransmitter.doesSourceIgnoreReceiver(this.source, this.receiver)
++                || !this.receiver.canvas$visibility.mayLocateExactly(this.source); // Canvas - visibility anticheat
+         }
+     }
+ 
+@@ -216,7 +224,8 @@ public interface WaypointTransmitter extends Waypoint {
+         public boolean isBroken() {
+             return WaypointTransmitter.ChunkConnection.super.isBroken()
+                 || WaypointTransmitter.doesSourceIgnoreReceiver(this.source, this.receiver)
+-                || WaypointTransmitter.isChunkVisible(this.lastPosition, this.receiver);
++                || WaypointTransmitter.isChunkVisible(this.lastPosition, this.receiver)
++                || !this.receiver.canvas$visibility.mayLocateExactly(this.source); // Canvas - visibility anticheat
+         }
+     }
+ }

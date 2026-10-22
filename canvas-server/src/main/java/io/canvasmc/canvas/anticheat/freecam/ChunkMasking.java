@@ -20,8 +20,9 @@ import org.jspecify.annotations.Nullable;
  * <p>
  * A masked section is sent as a section completely filled with the natural stone of its dimension, using the
  * single value palette, so it costs a few bytes and, having no bits per block, is skipped by Paper's anti-xray.
- * Biomes stay real since the client needs them for fog and colors of the surrounding sections. Air is never used as
- * filler: players would fall into it, and light would outline caves.
+ * Air is never used as filler: players would fall into it, and light would outline caves. Masked sections get the
+ * biomes of the chunk's top section, which is never masked, since underground biomes (deep dark, lush caves) would
+ * give away what lies below. The client only uses biomes at visible positions (colors, fog at the camera).
  * <p>
  * Light sections are indexed from one section below the world, so light index {@code i} is chunk section
  * {@code i - 1}.
@@ -57,8 +58,13 @@ public final class ChunkMasking {
      */
     public static int maskedSectionSize(final LevelChunk chunk, final LevelChunkSection section, final int sectionIndex) {
         final int filler = fillerId(chunk.getLevel(), chunk.getMinSectionY() + sectionIndex);
-        // block count, fluid count, bits per entry, palette entry, then the real biomes
-        return 2 + 2 + 1 + VarInt.getByteSize(filler) + section.getBiomes().getSerializedSize();
+        // block count, fluid count, bits per entry, palette entry, then the biomes
+        return 2 + 2 + 1 + VarInt.getByteSize(filler) + biomeSource(chunk).getBiomes().getSerializedSize();
+    }
+
+    private static LevelChunkSection biomeSource(final LevelChunk chunk) {
+        final LevelChunkSection[] sections = chunk.getSections();
+        return sections[sections.length - 1];
     }
 
     /**
@@ -70,7 +76,7 @@ public final class ChunkMasking {
         // single value palette: no bits per entry and no data array
         buffer.writeByte(0);
         buffer.writeVarInt(fillerId(chunk.getLevel(), chunk.getMinSectionY() + sectionIndex));
-        section.getBiomes().write(buffer, null, sectionIndex);
+        biomeSource(chunk).getBiomes().write(buffer, null, sectionIndex);
     }
 
     private static boolean isMaskedLightIndex(final long maskedSections, final int lightIndex) {

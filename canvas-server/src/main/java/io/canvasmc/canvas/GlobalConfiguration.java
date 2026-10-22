@@ -576,7 +576,9 @@ public class GlobalConfiguration extends Part {
             option("workerThreads")
                 .docs(
                     "Amount of threads used for the asynchronous visibility computations (ray tracing and occlusion",
-                    "culling). Use -1 to pick a value based on the amount of available cores. Takes effect on restart"
+                    "culling), split between a pool for anti-ESP and anti-freecam and one for the anti-xray passes, each",
+                    "with at least one thread. Use -1 to pick a value based on the amount of available cores. Takes effect",
+                    "on restart"
                 ).greaterThanOrEqualTo(-1.0F);
         }
 

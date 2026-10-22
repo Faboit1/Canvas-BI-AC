@@ -55,8 +55,8 @@ public interface VisibilityModule {
     }
 
     /**
-     * Whether players notice late results of this module, so its jobs are run before those of other modules when the
-     * worker pool is busy.
+     * Whether players notice late results of this module, so its jobs run on the urgent worker pool, which jobs of
+     * the other modules can't hold up.
      */
     default boolean isLatencySensitive() {
         return true;
