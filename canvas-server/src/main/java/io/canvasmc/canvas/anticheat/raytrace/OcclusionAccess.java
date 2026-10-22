@@ -21,7 +21,7 @@ import org.jspecify.annotations.Nullable;
  * the predicate the client uses for face culling and its section visibility graph. Instances cache the last
  * accessed chunk and are therefore not thread safe, use one instance per job.
  */
-public final class OcclusionAccess {
+public final class OcclusionAccess implements BlockOcclusion {
 
     private static final BlockState LAVA_SOURCE = Blocks.LAVA.defaultBlockState();
 
@@ -73,6 +73,7 @@ public final class OcclusionAccess {
      * Unloaded chunks are treated as occluding, so missing data never reveals anything. Positions outside the
      * build height are air.
      */
+    @Override
     public boolean isOpaque(final int x, final int y, final int z) {
         if (y < this.minY || y > this.maxY) {
             return false;

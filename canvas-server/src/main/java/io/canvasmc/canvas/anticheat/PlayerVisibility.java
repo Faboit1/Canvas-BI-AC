@@ -141,24 +141,30 @@ public final class PlayerVisibility {
         }
         this.undergroundViewDistance.tick(config.undergroundViewDistance);
 
-        if (this.jobInFlight) {
-            if (!this.jobDone) {
-                return;
-            }
+        if (this.jobInFlight && this.jobDone) {
             this.jobInFlight = false;
             this.jobDone = false;
-            final CameraSnapshot snapshot = this.jobSnapshot;
+            final CameraSnapshot jobSnapshot = this.jobSnapshot;
             this.jobSnapshot = null;
-            if (snapshot != null && snapshot.epoch == this.epoch) {
+            if (jobSnapshot != null && jobSnapshot.epoch == this.epoch) {
                 for (int i = 0; i < this.modules.length; ++i) {
                     if (this.jobModules[i] && this.moduleActive[i]) {
-                        this.modules[i].applyResults(snapshot);
+                        this.modules[i].applyResults(jobSnapshot);
                     }
                 }
             }
         }
 
         final CameraSnapshot snapshot = this.snapshot(level);
+        for (int i = 0; i < this.modules.length; ++i) {
+            if (this.moduleActive[i]) {
+                this.modules[i].tick(snapshot);
+            }
+        }
+        if (this.jobInFlight) {
+            return;
+        }
+
         boolean any = false;
         for (int i = 0; i < this.modules.length; ++i) {
             final boolean run = this.moduleActive[i] && this.modules[i].prepareAsync(snapshot);
@@ -275,7 +281,9 @@ public final class PlayerVisibility {
      * with other players.
      */
     public boolean needsPersonalChunkPackets() {
-        return this.isActive(this.antiXray) || this.isActive(this.antiFreecam) || this.bypassesAntiXray();
+        // evaluated live, chunks can be sent before the first tick of a player
+        final WorldConfig.Anticheat config = this.config();
+        return this.antiXray.isActive(config) || this.antiFreecam.isActive(config) || this.bypassesAntiXray();
     }
 
     /**
@@ -317,7 +325,14 @@ public final class PlayerVisibility {
      * Entity tracker check, called every tick for every entity in tracking range. Must be cheap.
      */
     public boolean canSee(final Entity entity) {
-        return this.antiEsp.canSee(entity);
+        return !this.antiFreecam.isEntityMasked(entity) && this.antiEsp.canSee(entity);
+    }
+
+    /**
+     * Called by the player chunk loader before it sends a chunk, chunks that may not be sent yet stay queued.
+     */
+    public boolean mayChunkBeSent(final int chunkX, final int chunkZ) {
+        return this.antiFreecam.mayChunkBeSent(chunkX, chunkZ);
     }
 
     /**
@@ -332,6 +347,26 @@ public final class PlayerVisibility {
      */
     public boolean isBlockHidden(final int x, final int y, final int z, final BlockState state) {
         return this.antiXray.isHidden(x, y, z, state) || this.antiFreecam.isMasked(x, y, z);
+    }
+
+    /**
+     * Cheap pre-check for {@link #isBlockHidden}: {@code false} if nothing in the chunk section is hidden from this
+     * player. Same thread rules.
+     */
+    public boolean mayHideInSection(final int chunkX, final int sectionY, final int chunkZ) {
+        return this.antiFreecam.isSectionMasked(chunkX, sectionY, chunkZ) || this.antiXray.mayHideInSection(chunkX, sectionY, chunkZ);
+    }
+
+    /**
+     * Called when the player is added to a world, before any chunk of it is sent, so state of the previous world is
+     * dropped before it could be mixed with the new one.
+     */
+    public void onAddedToWorld() {
+        final ServerLevel level = this.player.level();
+        if (level != this.lastLevel) {
+            this.lastLevel = level;
+            this.resetAll();
+        }
     }
 
     /**

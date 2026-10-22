@@ -9,10 +9,18 @@ lives in io.canvasmc.canvas.anticheat, this patch wires it into the chunk
 sending, entity tracking and block broadcasting code paths.
 
 diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
-index fad788a6541a7e9edd42f699d2968897d446a353..03ec4005879f15f7e733b2b2a076cdee50340607 100644
+index fad788a6541a7e9edd42f699d2968897d446a353..ae5074353a567f7600e9134e33382f57c4f0f890 100644
 --- a/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
 +++ b/ca/spottedleaf/moonrise/patches/chunk_system/player/RegionizedPlayerChunkLoader.java
-@@ -453,6 +453,7 @@ public final class RegionizedPlayerChunkLoader {
+@@ -196,6 +196,7 @@ public final class RegionizedPlayerChunkLoader {
+ 
+         final PlayerChunkLoaderData loader = new PlayerChunkLoaderData(this.world, player);
+ 
++        player.canvas$visibility.onAddedToWorld(); // Canvas - visibility anticheat
+         ((ChunkSystemServerPlayer)player).moonrise$setChunkLoader(loader);
+         loader.add();
+     }
+@@ -453,6 +454,7 @@ public final class RegionizedPlayerChunkLoader {
          }
  
          private void sendUnloadChunkRaw(final int chunkX, final int chunkZ) {
@@ -20,7 +28,17 @@ index fad788a6541a7e9edd42f699d2968897d446a353..03ec4005879f15f7e733b2b2a076cdee
              PlatformHooks.get().onChunkUnWatch(this.world, new ChunkPos(chunkX, chunkZ), this.player);
              // Note: Check PlayerChunkSender#dropChunk for other logic
              // Note: drop isAlive() check so that chunks properly unload client-side when the player dies
-@@ -887,7 +888,7 @@ public final class RegionizedPlayerChunkLoader {
+@@ -848,6 +850,9 @@ public final class RegionizedPlayerChunkLoader {
+                     // the target chunk may not be owned by this region, but this should be resolved in the future
+                     break;
+                 }
++                if (!this.player.canvas$visibility.mayChunkBeSent(pendingSendX, pendingSendZ)) { // Canvas - visibility anticheat - wait until anti-freecam knows which sections are visible
++                    break;
++                }
+                 if (!((ChunkSystemLevelChunk)chunk).moonrise$isPostProcessingDone()) {
+                     // not yet post-processed, need to do this so that tile entities can properly be sent to clients
+                     chunk.postProcessGeneration(this.world);
+@@ -887,7 +892,7 @@ public final class RegionizedPlayerChunkLoader {
              final int loadViewDistance = getLoadViewDistance(tickViewDistance, playerDistances.loadViewDistance, worldDistances.loadViewDistance);
              // send view cannot be greater-than load view
              final int clientViewDistance = getClientViewDistance(this.player);
@@ -29,7 +47,7 @@ index fad788a6541a7e9edd42f699d2968897d446a353..03ec4005879f15f7e733b2b2a076cdee
  
              // send view distances
              this.player.connection.send(this.updateClientChunkRadius(sendViewDistance));
-@@ -934,7 +935,7 @@ public final class RegionizedPlayerChunkLoader {
+@@ -934,7 +939,7 @@ public final class RegionizedPlayerChunkLoader {
              final int loadViewDistance = getLoadViewDistance(tickViewDistance, playerDistances.loadViewDistance, worldDistances.loadViewDistance);
              // send view cannot be greater-than load view
              final int clientViewDistance = getClientViewDistance(this.player);
@@ -58,10 +76,10 @@ index fa322df502d1e6c6d603730372c572f62e70306a..080f170d3f8b19b09899097adafffd13
                  return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, (Boolean) s);
              }));
 diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..0cfa107de10d4bea735f895e29130f63e1f339e3 100644
+index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..7d9e10350a2af790fcccf2012ab50dbdb106f291 100644
 --- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 +++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-@@ -60,6 +60,28 @@ public class ClientboundLevelChunkPacketData {
+@@ -60,6 +60,34 @@ public class ClientboundLevelChunkPacketData {
          this.ready = ready;
      }
      // Paper end - Async-Anti-Xray - Ready flag for the connection
@@ -87,30 +105,138 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..0cfa107de10d4bea735f895e29130f63
 +            && filter.test(blockEntityPacket.getPos().getX() & 15, blockEntityPacket.getPos().getY(), blockEntityPacket.getPos().getZ() & 15));
 +    }
 +    // Canvas end - visibility anticheat
++    // Canvas start - visibility anticheat - anti-freecam
++    /**
++     * Bit set of the chunk section indexes that were written as filler instead of their real contents.
++     */
++    public final long canvas$maskedSections;
++    // Canvas end - visibility anticheat - anti-freecam
  
      @Deprecated @io.papermc.paper.annotation.DoNotUse // Paper - Anti-Xray - Add chunk packet info
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk) {
-@@ -68,6 +90,7 @@ public class ClientboundLevelChunkPacketData {
+@@ -68,20 +96,33 @@ public class ClientboundLevelChunkPacketData {
      }
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
          // Paper end - Anti-Xray - Add chunk packet info
++        // Canvas start - visibility anticheat - anti-freecam
++        this(levelChunk, chunkPacketInfo, 0L);
++    }
++
++    /**
++     * @param maskedSections bit set of the section indexes to send as filler, see
++     *                       {@link io.canvasmc.canvas.anticheat.freecam.ChunkMasking}
++     */
++    public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final long maskedSections) {
++        this.canvas$maskedSections = maskedSections;
++        // Canvas end - visibility anticheat - anti-freecam
 +        this.canvas$chunkPacketInfo = chunkPacketInfo; // Canvas - visibility anticheat
          this.heightmaps = levelChunk.getHeightmaps()
              .stream()
              .filter(entryx -> ((Heightmap.Types)entryx.getKey()).sendToClient())
-@@ -101,6 +124,7 @@ public class ClientboundLevelChunkPacketData {
+             .collect(Collectors.toMap(Entry::getKey, entryx -> (long[])((Heightmap)entryx.getValue()).getRawData().clone()));
+-        this.buffer = new byte[calculateChunkSize(levelChunk)];
++        this.buffer = new byte[calculateChunkSize(levelChunk, maskedSections)]; // Canvas - visibility anticheat - anti-freecam
+         // Paper start - Anti-Xray - Add chunk packet info
+         if (chunkPacketInfo != null) {
+             chunkPacketInfo.setBuffer(this.buffer);
+         }
+-        extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo);
++        extractChunkData(new FriendlyByteBuf(this.getWriteBuffer()), levelChunk, chunkPacketInfo, maskedSections); // Canvas - visibility anticheat - anti-freecam
+         this.blockEntitiesData = Lists.newArrayList();
+         int totalTileEntities = 0; // Paper - Handle oversized block entities in chunks
+ 
+         for (BlockEntity blockEntity : levelChunk.canvas$getAllBlockEntities()) { // Canvas - optimize block entity fetching
++            if (maskedSections != 0L && io.canvasmc.canvas.anticheat.freecam.ChunkMasking.isMasked(maskedSections, levelChunk, blockEntity.getBlockPos().getY())) continue; // Canvas - visibility anticheat - anti-freecam
+             // Paper start - Handle oversized block entities in chunks
+             if (++totalTileEntities > BLOCK_ENTITY_LIMIT) {
+                 net.minecraft.network.protocol.Packet<ClientGamePacketListener> packet = blockEntity.getUpdatePacket(); // Canvas - optimize block entity fetching
+@@ -101,14 +142,22 @@ public class ClientboundLevelChunkPacketData {
          this.heightmaps = heightmaps;
          this.buffer = buffer;
          this.blockEntitiesData = blockEntitiesData;
 +        this.canvas$chunkPacketInfo = null; // Canvas - visibility anticheat
++        this.canvas$maskedSections = 0L; // Canvas - visibility anticheat - anti-freecam
      }
  
-     private static int calculateChunkSize(final LevelChunk chunk) {
+-    private static int calculateChunkSize(final LevelChunk chunk) {
++    private static int calculateChunkSize(final LevelChunk chunk, final long maskedSections) { // Canvas - visibility anticheat - anti-freecam
+         int total = 0;
+ 
+-        for (LevelChunkSection section : chunk.getSections()) {
+-            total += section.getSerializedSize();
++        // Canvas start - visibility anticheat - anti-freecam
++        final LevelChunkSection[] sections = chunk.getSections();
++        for (int sectionIndex = 0; sectionIndex < sections.length; ++sectionIndex) {
++            final LevelChunkSection section = sections[sectionIndex];
++            total += (maskedSections >>> sectionIndex & 1L) != 0L
++                ? io.canvasmc.canvas.anticheat.freecam.ChunkMasking.maskedSectionSize(chunk, section, sectionIndex)
++                : section.getSerializedSize();
+         }
++        // Canvas end - visibility anticheat - anti-freecam
+ 
+         return total;
+     }
+@@ -125,8 +174,18 @@ public class ClientboundLevelChunkPacketData {
+         extractChunkData(buffer, chunk, null);
+     }
+     public static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
++        // Canvas start - visibility anticheat - anti-freecam
++        extractChunkData(buffer, chunk, chunkPacketInfo, 0L);
++    }
++    public static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final long maskedSections) {
++        // Canvas end - visibility anticheat - anti-freecam
+         int chunkSectionIndex = 0;
+         for (LevelChunkSection section : chunk.getSections()) {
++            // Canvas start - visibility anticheat - anti-freecam - left unwritten for anti-xray, which skips such sections
++            if ((maskedSections >>> chunkSectionIndex & 1L) != 0L) {
++                io.canvasmc.canvas.anticheat.freecam.ChunkMasking.writeMaskedSection(buffer, chunk, section, chunkSectionIndex);
++            } else
++            // Canvas end - visibility anticheat - anti-freecam
+             section.write(buffer, chunkPacketInfo, chunkSectionIndex);
+             chunkSectionIndex++;
+             // Paper end - Anti-Xray - Add chunk packet info
+diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+index 1b83d541378c98e3517904973e3ea4e33098a914..cb2a879640d26038b5dfc653b2f8209b8fbe0d33 100644
+--- a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
+@@ -53,13 +53,30 @@ public record ClientboundLevelChunkWithLightPacket(int x, int z, ClientboundLeve
+         final boolean modifyBlocks
+     ) {
+         // Paper end - Anti-Xray
++        // Canvas start - visibility anticheat - anti-freecam
++        this(levelChunk, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter, modifyBlocks, 0L);
++    }
++
++    /**
++     * @param maskedSections bit set of the section indexes sent as filler, without light, see
++     *                       {@link io.canvasmc.canvas.anticheat.freecam.ChunkMasking}
++     */
++    public ClientboundLevelChunkWithLightPacket(
++        final LevelChunk levelChunk,
++        final LevelLightEngine lightEngine,
++        final @Nullable BitSet skyChangedLightSectionFilter,
++        final @Nullable BitSet blockChangedLightSectionFilter,
++        final boolean modifyBlocks,
++        final long maskedSections
++    ) {
++        // Canvas end - visibility anticheat - anti-freecam
+         ChunkPos chunkPos = levelChunk.getPos();
+         io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo = modifyBlocks ? levelChunk.getLevel().chunkPacketBlockController.getChunkPacketInfo(levelChunk) : null; // Paper - Anti-Xray
+         this(
+             chunkPos.x(),
+             chunkPos.z(),
+-            new ClientboundLevelChunkPacketData(levelChunk, chunkPacketInfo), // Paper - Anti-Xray
+-            new ClientboundLightUpdatePacketData(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter)
++            new ClientboundLevelChunkPacketData(levelChunk, chunkPacketInfo, maskedSections), // Paper - Anti-Xray // Canvas - visibility anticheat - anti-freecam
++            io.canvasmc.canvas.anticheat.freecam.ChunkMasking.maskLight(new ClientboundLightUpdatePacketData(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter), maskedSections) // Canvas - visibility anticheat - anti-freecam
+         );
+         // Paper start - Anti-Xray - Modify blocks
+         if (chunkPacketInfo != null) {
 diff --git a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..2e45757c3d4c6b65893e78e8f2a6e6275bc0870a 100644
+index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..96bbff01a7f637362b4baa85d4a211b88df34731 100644
 --- a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
 +++ b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-@@ -48,6 +48,45 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
+@@ -48,6 +48,48 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
          this.states = blockChanges.values().toArray(new BlockState[0]);
      }
      // Paper end - Multi Block Change API
@@ -126,6 +252,9 @@ index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..2e45757c3d4c6b65893e78e8f2a6e627
 +     * all changes are hidden
 +     */
 +    public @org.jspecify.annotations.Nullable ClientboundSectionBlocksUpdatePacket canvas$filter(final io.canvasmc.canvas.anticheat.PlayerVisibility visibility) {
++        if (!visibility.mayHideInSection(this.sectionPos.x(), this.sectionPos.y(), this.sectionPos.z())) {
++            return this;
++        }
 +        final int minX = this.sectionPos.minBlockX();
 +        final int minY = this.sectionPos.minBlockY();
 +        final int minZ = this.sectionPos.minBlockZ();
@@ -391,3 +520,41 @@ index c25866c36a5c44c4e29bea68e9a4a7efcbc16a5e..3f7740bc7ef31c312206b8ee5649f0d4
      private static final EntityDataAccessor<Integer> DATA_SCORE_ID = SynchedEntityData.defineId(Player.class, EntityDataSerializers.INT);
      private static final EntityDataAccessor<OptionalInt> DATA_SHOULDER_PARROT_LEFT = SynchedEntityData.defineId(
          Player.class, EntityDataSerializers.OPTIONAL_UNSIGNED_INT
+diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
+index 4e1359f85d66185c57a27302fd4672cd7e265874..e05d4c956ad13afb0195913145e17473e6a28319 100644
+--- a/net/minecraft/world/level/chunk/LevelChunkSection.java
++++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
+@@ -40,6 +40,17 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+         return this.tickingBlocks;
+     }
+     // Paper end - block counting
++    // Canvas start - visibility anticheat
++    /**
++     * Bumped whenever a block changes between rendering as a full opaque cube and not, see
++     * {@link io.canvasmc.canvas.anticheat.freecam.SectionVisibility}.
++     */
++    public int canvas$opacityVersion;
++    /**
++     * The cached visibility set of this section together with the opacity version it was computed for.
++     */
++    public volatile long canvas$visibility;
++    // Canvas end - visibility anticheat
+ 
+     private LevelChunkSection(final LevelChunkSection source) {
+         this.nonEmptyBlockCount = source.nonEmptyBlockCount;
+@@ -133,6 +144,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+         } else {
+             previous = this.states.getAndSetUnchecked(sectionX, sectionY, sectionZ, state);
+         }
++        if (previous.isSolidRender() != state.isSolidRender()) io.canvasmc.canvas.anticheat.freecam.SectionVisibility.onOpacityChange(this); // Canvas - visibility anticheat
+ 
+         if (!previous.isAir()) {
+             this.nonEmptyBlockCount--;
+@@ -253,6 +265,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+             }
+         }
+         // Paper end - block counting
++        io.canvasmc.canvas.anticheat.freecam.SectionVisibility.onOpacityChange(this); // Canvas - visibility anticheat - blocks were changed in bulk, bumped last so readers never pair the new version with the counts being rebuilt
+     }
+ 
+     public PalettedContainer<BlockState> getStates() {

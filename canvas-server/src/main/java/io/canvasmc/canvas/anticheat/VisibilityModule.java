@@ -39,6 +39,14 @@ public interface VisibilityModule {
     void applyResults(CameraSnapshot snapshot);
 
     /**
+     * Called every tick while the module is active, after finished results were applied, also while a job is
+     * running. For synchronous work that must not wait for a job, it must not touch the inputs or results of the
+     * running job.
+     */
+    default void tick(final CameraSnapshot snapshot) {
+    }
+
+    /**
      * Called every tick while no job is running for this player.
      *
      * @return whether asynchronous work is needed now. If so, inputs for {@link #runAsync} should be copied here

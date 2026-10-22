@@ -4,7 +4,7 @@ import net.minecraft.util.Mth;
 
 /**
  * Exact voxel traversal (Amanatides &amp; Woo, "A Fast Voxel Traversal Algorithm for Ray Tracing") against
- * {@link OcclusionAccess}.
+ * {@link BlockOcclusion}, usually an {@link OcclusionAccess} or the {@link OcclusionCache} of a pass.
  * <p>
  * Unlike fixed step ray marching this visits every cell the segment passes through, so thin walls and diagonal
  * corners are never skipped. The traversal steps one axis at a time, which means a segment passing exactly
@@ -22,7 +22,7 @@ public final class VoxelRaycaster {
      * @param testEnd whether the cell containing the end point is tested
      * @return {@code true} if none of the tested cells occlude
      */
-    public static boolean isClear(final OcclusionAccess access,
+    public static boolean isClear(final BlockOcclusion access,
                                   final double x0, final double y0, final double z0,
                                   final double x1, final double y1, final double z1,
                                   final boolean testStart, final boolean testEnd) {
@@ -97,7 +97,7 @@ public final class VoxelRaycaster {
      * occluding cell is entered, or {@code maxDistance} if there is none. The cell containing the origin is
      * not tested. Used to place third person cameras, which the client pulls in front of blocks.
      */
-    public static double clipDistance(final OcclusionAccess access,
+    public static double clipDistance(final BlockOcclusion access,
                                       final double x0, final double y0, final double z0,
                                       final double dirX, final double dirY, final double dirZ,
                                       final double maxDistance) {

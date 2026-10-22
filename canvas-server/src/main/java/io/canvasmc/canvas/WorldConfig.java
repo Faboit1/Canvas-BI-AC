@@ -670,7 +670,7 @@ public class WorldConfig extends Part {
 
             {
                 option("enabled").docs("Whether anti-ESP is enabled in this world");
-                option("alwaysVisibleDistance").docs("Entities within this many blocks of the player's eyes are always visible").greaterThanOrEqualTo(0.0F);
+                option("alwaysVisibleDistance").docs("Entities whose hitbox is within this many blocks of the player's eyes are always visible").greaterThanOrEqualTo(0.0F);
                 option("maxTraceDistance")
                     .docs(
                         "Entities further than this many blocks away are always visible. Use this to bound the cost on servers",
@@ -684,18 +684,32 @@ public class WorldConfig extends Part {
                     );
                 option("respectVanillaNameTags")
                     .docs(
-                        "If true, players whose name tag would be rendered through walls by a vanilla client (not sneaking,",
-                        "not invisible, within 64 blocks, allowed by scoreboard team rules) are never hidden. This keeps",
-                        "vanilla behavior exactly, but means those players aren't protected from ESP"
+                        "If true, entities whose name tag would be rendered through walls by a vanilla client are never",
+                        "hidden: players that aren't sneaking, aren't invisible to the viewer, are within 64 blocks and are",
+                        "allowed by scoreboard team rules, and entities with an always visible custom name (holograms). This",
+                        "keeps vanilla behavior exactly, but means those entities aren't protected from ESP"
                     );
-                option("hideProjectiles").docs("Whether projectiles (arrows, tridents, fireballs, ...) are hidden. They are fast, so hiding them can delay them visually");
-                option("visibleRecheckIntervalTicks").docs("How often, in ticks, entities that are currently visible are re-checked. Hidden entities are re-checked every tick").greaterThan(0.0F);
+                option("hideProjectiles")
+                    .docs(
+                        "Whether projectiles (arrows, tridents, fireballs, ...) are hidden. They are fast, so hiding them can",
+                        "delay them visually. A player's own projectiles and fishing bobber are always visible to them"
+                    );
+                option("visibleRecheckIntervalTicks")
+                    .docs(
+                        "How often, in ticks, entities that are currently visible are re-checked. Hidden entities are",
+                        "re-checked every tick while they or the player move, and every other tick otherwise"
+                    ).greaterThan(0.0F);
                 option("hideGraceTicks")
                     .docs(
                         "How many ticks an entity stays visible after the line of sight to it was lost. Prevents flickering",
                         "at corners and makes peeking behave smoothly"
                     ).greaterThanOrEqualTo(0.0F);
-                option("excludedEntityTypes").docs("Entity types that are never hidden, for example \"minecraft:item_display\"");
+                option("excludedEntityTypes")
+                    .docs(
+                        "Entity types that are never hidden, for example \"minecraft:armor_stand\". Bosses, lightning, end",
+                        "crystals, area effect clouds, leash knots, and display and interaction entities that aren't riding",
+                        "another entity are never hidden anyway"
+                    );
             }
 
             public boolean enabled = false;
@@ -708,6 +722,31 @@ public class WorldConfig extends Part {
             public int visibleRecheckIntervalTicks = 4;
             public int hideGraceTicks = 10;
             public List<String> excludedEntityTypes = new ArrayList<>();
+
+            private final java.util.concurrent.atomic.AtomicReference<java.util.@Nullable Set<EntityType<?>>> excludedEntityTypesCache = new java.util.concurrent.atomic.AtomicReference<>();
+
+            /**
+             * The entity types of {@link #excludedEntityTypes}, parsed once per loaded configuration. Unknown ids are
+             * logged and ignored.
+             */
+            public java.util.Set<EntityType<?>> compiledExcludedEntityTypes() {
+                final java.util.Set<EntityType<?>> compiled = this.excludedEntityTypesCache.get();
+                if (compiled != null) {
+                    return compiled;
+                }
+                final java.util.Set<EntityType<?>> ret = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>();
+                for (final String name : this.excludedEntityTypes) {
+                    final Identifier id = Identifier.tryParse(name);
+                    final EntityType<?> type = id == null ? null : BuiltInRegistries.ENTITY_TYPE.getOptional(id).orElse(null);
+                    if (type == null) {
+                        LOGGER.warn("Ignoring unknown entity type \"{}\" in the anti-ESP excluded entity types", name);
+                    } else {
+                        ret.add(type);
+                    }
+                }
+                final java.util.Set<EntityType<?>> witness = this.excludedEntityTypesCache.compareAndExchange(null, ret);
+                return witness == null ? ret : witness;
+            }
         }
 
         {
@@ -735,11 +774,17 @@ public class WorldConfig extends Part {
                         "reachable through the occlusion graph from there. Larger values hide latency for fast moving players"
                     ).between(2.0F, 32.0F);
                 option("maxResendsPerTick").docs("Maximum amount of chunks re-sent to a single player per tick to reveal newly visible sections").greaterThan(0.0F);
+                option("updateIntervalTicks")
+                    .docs(
+                        "How often, in ticks, the occlusion graph of a player that doesn't move is checked for block changes",
+                        "that open up new lines of sight. Moving players and newly sent chunks are handled immediately"
+                    ).greaterThan(0.0F);
             }
 
             public boolean enabled = false;
             public double revealMargin = 8.0D;
             public int maxResendsPerTick = 8;
+            public int updateIntervalTicks = 10;
         }
 
         {

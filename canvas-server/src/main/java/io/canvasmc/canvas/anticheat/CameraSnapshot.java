@@ -2,6 +2,7 @@ package io.canvasmc.canvas.anticheat;
 
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
+import net.minecraft.util.Mth;
 import net.minecraft.server.level.ServerLevel;
 import org.jspecify.annotations.Nullable;
 
@@ -117,6 +118,10 @@ public final class CameraSnapshot {
     }
 
     private double clip(final OcclusionAccess access, final double dirX, final double dirY, final double dirZ) {
+        if (access.isOpaque(Mth.floor(this.eyeX), Mth.floor(this.eyeY), Mth.floor(this.eyeZ))) {
+            // the client's camera collision starts at the eyes, inside a block it can't move away from them
+            return 0.0;
+        }
         final double hit = VoxelRaycaster.clipDistance(
             access, this.eyeX, this.eyeY, this.eyeZ, dirX, dirY, dirZ, this.cameraDistance + CAMERA_CLIP_MARGIN
         );
