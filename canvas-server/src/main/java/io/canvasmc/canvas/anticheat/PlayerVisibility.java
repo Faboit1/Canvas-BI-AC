@@ -29,6 +29,7 @@ import org.jspecify.annotations.Nullable;
  */
 public final class PlayerVisibility {
 
+    public static final String BYPASS_ALL = "canvas.anticheat.bypass";
     public static final String BYPASS_ANTI_XRAY = "canvas.anticheat.bypass.antixray";
     public static final String BYPASS_ANTI_ESP = "canvas.anticheat.bypass.antiesp";
     public static final String BYPASS_ANTI_FREECAM = "canvas.anticheat.bypass.antifreecam";
@@ -75,6 +76,29 @@ public final class PlayerVisibility {
         this.modules = new VisibilityModule[] {this.antiXray, this.antiEsp, this.antiFreecam};
         this.moduleActive = new boolean[this.modules.length];
         this.jobModules = new boolean[this.modules.length];
+    }
+
+    /**
+     * Registers the bypass permissions with a default of false. Unregistered permissions default to operators, which
+     * would silently exempt every operator from all checks.
+     */
+    public static void registerPermissions() {
+        final org.bukkit.plugin.PluginManager pluginManager = org.bukkit.Bukkit.getPluginManager();
+        final java.util.Map<String, Boolean> children = new java.util.LinkedHashMap<>();
+        registerPermission(pluginManager, BYPASS_ANTI_XRAY, "Bypasses Canvas' anti-xray, including Paper's obfuscation", children);
+        registerPermission(pluginManager, BYPASS_ANTI_ESP, "Bypasses Canvas' anti-ESP", children);
+        registerPermission(pluginManager, BYPASS_ANTI_FREECAM, "Bypasses Canvas' anti-freecam", children);
+        registerPermission(pluginManager, BYPASS_UNDERGROUND_VIEW_DISTANCE, "Bypasses Canvas' underground view distance", children);
+        if (pluginManager.getPermission(BYPASS_ALL) == null) {
+            pluginManager.addPermission(new org.bukkit.permissions.Permission(BYPASS_ALL, "Bypasses all of Canvas' visibility anticheat", org.bukkit.permissions.PermissionDefault.FALSE, children));
+        }
+    }
+
+    private static void registerPermission(final org.bukkit.plugin.PluginManager pluginManager, final String name, final String description, final java.util.Map<String, Boolean> parentChildren) {
+        parentChildren.put(name, Boolean.TRUE);
+        if (pluginManager.getPermission(name) == null) {
+            pluginManager.addPermission(new org.bukkit.permissions.Permission(name, description, org.bukkit.permissions.PermissionDefault.FALSE));
+        }
     }
 
     /**

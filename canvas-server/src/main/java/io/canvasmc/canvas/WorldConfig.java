@@ -592,7 +592,8 @@ public class WorldConfig extends Part {
                 ).blank()
                 .wordWrap(
                     "Bypass permissions: \"canvas.anticheat.bypass.antixray\", \"canvas.anticheat.bypass.antiesp\",",
-                    "\"canvas.anticheat.bypass.antifreecam\" and \"canvas.anticheat.bypass.undergroundviewdistance\".",
+                    "\"canvas.anticheat.bypass.antifreecam\" and \"canvas.anticheat.bypass.undergroundviewdistance\",",
+                    "or \"canvas.anticheat.bypass\" for all of them. They are not granted to operators by default.",
                     "Spectators always bypass anti-esp and anti-freecam"
                 )
             );

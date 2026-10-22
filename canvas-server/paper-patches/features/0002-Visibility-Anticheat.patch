@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Faboit1 <omarassayed3@gmail.com>
+Date: Thu, 22 Oct 2026 11:51:59 +0000
+Subject: [PATCH] Visibility Anticheat
+
+Registers the bypass permissions of Canvas' visibility anticheat with a
+default of false, so operators aren't silently exempt.
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java b/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java
+index 7ad31b059c1c7a1a2fae1fa7a3359da5343e217d..38a1b8a65b86bd667c175a22a97b4ef146334837 100644
+--- a/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java
++++ b/src/main/java/org/bukkit/craftbukkit/util/permissions/CraftDefaultPermissions.java
+@@ -17,5 +17,6 @@ public final class CraftDefaultPermissions {
+         DefaultPermissions.registerPermission(CraftDefaultPermissions.ROOT + ".debugstick.always", "Gives the user the ability to use the debug stick in all game modes", org.bukkit.permissions.PermissionDefault.FALSE/* , parent */); // Paper - should not have this parent, as it's not a "vanilla" utility
+         DefaultPermissions.registerPermission(CraftDefaultPermissions.ROOT + ".commandblock", "Gives the user the ability to use command blocks.", org.bukkit.permissions.PermissionDefault.OP, parent); // Paper
+         parent.recalculatePermissibles();
++        io.canvasmc.canvas.anticheat.PlayerVisibility.registerPermissions(); // Canvas - visibility anticheat
+     }
+ }
