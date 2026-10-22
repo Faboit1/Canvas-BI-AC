@@ -561,6 +561,28 @@ public class GlobalConfiguration extends Part {
     public boolean cacheMinecraft2BukkitEntityTypeConversion = false;
     public boolean tileEntitySnapshotCreation = false;
 
+    {
+        option("anticheat")
+            .docs(
+                "Server-wide settings for Canvas' native visibility anticheat. The per-world options (ray traced",
+                "anti-xray, anti-ESP, anti-freecam and the underground view distance) live in canvas-worlds.yml"
+            );
+    }
+
+    public Anticheat anticheat = new Anticheat();
+    public static class Anticheat extends Part {
+
+        {
+            option("workerThreads")
+                .docs(
+                    "Amount of threads used for the asynchronous visibility computations (ray tracing and occlusion",
+                    "culling). Use -1 to pick a value based on the amount of available cores. Takes effect on restart"
+                ).greaterThanOrEqualTo(-1.0F);
+        }
+
+        public int workerThreads = -1;
+    }
+
     public PurpurContainers purpurContainers = new PurpurContainers();
     public static class PurpurContainers extends Part {
 
