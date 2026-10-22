@@ -133,6 +133,15 @@ public final class VisibilityFilters {
     }
 
     /**
+     * Whether pistons treat the block like the filler anti-freecam sends instead of it: a block that moves like stone,
+     * where air or a fluid would end the pushed blocks. Unloaded blocks don't.
+     */
+    public static boolean movesLikeFiller(final ServerLevel level, final int x, final int y, final int z) {
+        final BlockState state = level.getBlockStateIfLoaded(new BlockPos(x, y, z));
+        return state != null && !state.isAir() && state.getFluidState().isEmpty() && movesLikeStone(level, x, y, z);
+    }
+
+    /**
      * Block breaking progress (the crack overlay) is broadcast to everyone within 32 blocks. It must not reach players
      * the breaker is hidden from by anti-ESP, nor players the block itself is hidden from.
      */
@@ -194,21 +203,17 @@ public final class VisibilityFilters {
     /**
      * Called when a block changed between occluding and not occluding, which may change what players can potentially
      * see. Players the chunk was sent to get their anti-freecam visibility checked soon, instead of at the next
-     * periodic update. Changes inside sections masked for a player are skipped, no view leads into those.
+     * periodic update, see {@link FreecamGuard#onOpacityChange}.
+     *
+     * @param opaque whether the block occludes now
      */
-    public static void onOpacityChange(final ServerLevel level, final BlockPos pos) {
+    public static void onOpacityChange(final ServerLevel level, final BlockPos pos, final boolean opaque) {
         if (!level.canvasConfig().anticheat.antiFreecam.enabled) {
             return;
         }
-        final int chunkX = pos.getX() >> 4;
-        final int sectionY = pos.getY() >> 4;
-        final int chunkZ = pos.getZ() >> 4;
-        final List<ServerPlayer> players = level.getChunkSource().chunkMap.getPlayers(new ChunkPos(chunkX, chunkZ), false);
+        final List<ServerPlayer> players = level.getChunkSource().chunkMap.getPlayers(new ChunkPos(pos.getX() >> 4, pos.getZ() >> 4), false);
         for (int i = 0, len = players.size(); i < len; ++i) {
-            final FreecamGuard antiFreecam = players.get(i).canvas$visibility.antiFreecam;
-            if (!antiFreecam.isSectionMasked(chunkX, sectionY, chunkZ)) {
-                antiFreecam.onOpacityChange();
-            }
+            players.get(i).canvas$visibility.onOpacityChange(level, pos, opaque);
         }
     }
 

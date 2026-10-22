@@ -2,7 +2,7 @@ package io.canvasmc.canvas.anticheat.freecam;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import net.minecraft.util.BitStorage;
+import java.util.Arrays;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.GlobalPalette;
@@ -22,6 +22,8 @@ import org.jspecify.annotations.Nullable;
  * {@link LevelChunkSection#setBlockState} bumps when a block changes between opaque and not opaque. It is computed
  * lazily by whichever anticheat worker needs it first, from racy reads of the block palette. Readers race the owning
  * region thread: a concurrent change is either seen, or bumps the version again so the next reader recomputes.
+ * The opacity of the blocks themselves, which per-block anti-freecam needs, is cached the same way
+ * ({@link #opacity}).
  */
 public final class SectionVisibility {
 
@@ -34,6 +36,23 @@ public final class SectionVisibility {
 
     public static final long NONE = 0L;
     public static final long ALL = (1L << 36) - 1L;
+
+    /**
+     * Longs of an opacity bit set, see {@link #opacity}.
+     */
+    public static final int OPACITY_WORDS = 64;
+    /**
+     * Opacity of a section without opaque blocks. Must not be modified.
+     */
+    public static final long[] NOTHING_OPAQUE = new long[OPACITY_WORDS];
+    /**
+     * Opacity of a section made of opaque blocks only. Must not be modified.
+     */
+    public static final long[] EVERYTHING_OPAQUE = new long[OPACITY_WORDS];
+
+    private static final int CLEAR = 0;
+    private static final int OPAQUE = 1;
+    private static final int MIXED = 2;
 
     private static final int SECTION_VOLUME = 16 * 16 * 16;
     /**
@@ -63,6 +82,7 @@ public final class SectionVisibility {
     private static volatile boolean @Nullable [] globalOpaque;
 
     static {
+        Arrays.fill(EVERYTHING_OPAQUE, -1L);
         for (int faces = 0; faces < 64; ++faces) {
             long set = 0L;
             for (int from = 0; from < 6; ++from) {
@@ -128,6 +148,7 @@ public final class SectionVisibility {
         final long[] opaque = new long[SECTION_VOLUME / 64];
         final int[] queue = new int[SECTION_VOLUME];
         boolean[] paletteOpaque = new boolean[256];
+        boolean[] resolved = this.paletteOpaque;
     }
 
     /**
@@ -189,51 +210,98 @@ public final class SectionVisibility {
             return ALL;
         }
         final PalettedContainer.Data<BlockState> data = section.getStates().data;
-        final Palette<BlockState> palette = data.palette();
-        final BitStorage storage = data.storage();
-        final int bits = storage.getBits();
-
-        final boolean[] opaqueById;
-        if (palette instanceof GlobalPalette<BlockState>) {
-            opaqueById = globalOpaque();
-        } else {
-            final int size = palette.getSize();
-            if (bits == 0 || size == 1) {
-                final BlockState state = readPalette(palette, 0);
-                return state != null && state.isSolidRender() ? NONE : ALL;
-            }
-            boolean[] local = scratch.paletteOpaque;
-            if (local.length < size) {
-                scratch.paletteOpaque = local = new boolean[size];
-            }
-            boolean anyOpaque = false;
-            boolean allOpaque = true;
-            for (int i = 0; i < size; ++i) {
-                final BlockState state = readPalette(palette, i);
-                final boolean opaque = state != null && state.isSolidRender();
-                local[i] = opaque;
-                anyOpaque |= opaque;
-                allOpaque &= opaque;
-            }
-            if (!anyOpaque) {
+        switch (classify(data, scratch)) {
+            case CLEAR:
                 return ALL;
-            }
-            if (allOpaque) {
+            case OPAQUE:
                 return NONE;
-            }
-            // entries added concurrently are unknown and count as not opaque, which only adds connections
-            for (int i = size; i < local.length; ++i) {
-                local[i] = false;
-            }
-            opaqueById = local;
+            default:
+                break;
         }
-
         final long[] opaque = scratch.opaque;
-        if (!decode(storage.getRaw(), bits, opaqueById, opaque)) {
+        if (!decode(data.storage().getRaw(), data.storage().getBits(), scratch.resolved, opaque)) {
             // storage of another size than expected, raced a resize: count everything as see-through
             return ALL;
         }
         return resolve(opaque, scratch.queue);
+    }
+
+    /**
+     * Returns the opacity of every block of the section, one bit per block indexed by {@code x | z << 4 | y << 8}
+     * like the section's storage, so 64 longs. Mixed sections are decoded once per opacity version and cached in
+     * the section, uniform sections get {@link #NOTHING_OPAQUE} or {@link #EVERYTHING_OPAQUE}. May be called from
+     * any thread, under the same rules as {@link #get(LevelChunkSection, Scratch, int)}: blocks whose state can't
+     * be read because of a concurrent palette change count as not opaque, which only makes more visible.
+     *
+     * @param version the opacity version the caller read with {@link #version} right before
+     * @return an array that must not be modified, cached arrays have the version appended
+     */
+    public static long[] opacity(final LevelChunkSection section, final Scratch scratch, final int version) {
+        final long[] cached = section.canvas$opacity;
+        if (cached != null && cached[OPACITY_WORDS] == version) {
+            return cached;
+        }
+        if (section.hasOnlyAir()) {
+            return NOTHING_OPAQUE;
+        }
+        final PalettedContainer.Data<BlockState> data = section.getStates().data;
+        switch (classify(data, scratch)) {
+            case CLEAR:
+                return NOTHING_OPAQUE;
+            case OPAQUE:
+                return EVERYTHING_OPAQUE;
+            default:
+                break;
+        }
+        final long[] ret = new long[OPACITY_WORDS + 1];
+        if (!decode(data.storage().getRaw(), data.storage().getBits(), scratch.resolved, ret)) {
+            return NOTHING_OPAQUE;
+        }
+        ret[OPACITY_WORDS] = version;
+        section.canvas$opacity = ret;
+        return ret;
+    }
+
+    /**
+     * Resolves which palette entries are opaque. For {@link #MIXED} palettes the result is left in
+     * {@link Scratch#resolved}, indexed by the ids of the storage.
+     */
+    private static int classify(final PalettedContainer.Data<BlockState> data, final Scratch scratch) {
+        final Palette<BlockState> palette = data.palette();
+        if (palette instanceof GlobalPalette<BlockState>) {
+            scratch.resolved = globalOpaque();
+            return MIXED;
+        }
+        final int size = palette.getSize();
+        if (data.storage().getBits() == 0 || size == 1) {
+            final BlockState state = readPalette(palette, 0);
+            return state != null && state.isSolidRender() ? OPAQUE : CLEAR;
+        }
+        boolean[] local = scratch.paletteOpaque;
+        if (local.length < size) {
+            scratch.paletteOpaque = local = new boolean[size];
+        }
+        boolean anyOpaque = false;
+        boolean allOpaque = true;
+        for (int i = 0; i < size; ++i) {
+            final BlockState state = readPalette(palette, i);
+            final boolean opaque = state != null && state.isSolidRender();
+            local[i] = opaque;
+            anyOpaque |= opaque;
+            allOpaque &= opaque;
+        }
+        if (!anyOpaque) {
+            return CLEAR;
+        }
+        if (allOpaque) {
+            return OPAQUE;
+        }
+        // entries added concurrently are unknown and count as not opaque, which only adds connections
+        for (int i = size; i < local.length; ++i) {
+            local[i] = false;
+        }
+        scratch.resolved = local;
+        return MIXED;
     }
 
     private static @Nullable BlockState readPalette(final Palette<BlockState> palette, final int index) {

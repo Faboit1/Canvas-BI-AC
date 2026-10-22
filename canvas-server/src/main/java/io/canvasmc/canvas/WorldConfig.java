@@ -788,12 +788,23 @@ public class WorldConfig extends Part {
                         "that open up new lines of sight. Moving players, newly sent chunks and blocks changing between opaque",
                         "and transparent are handled immediately, this is only a fallback"
                     ).greaterThan(0.0F);
+                option("perBlock")
+                    .docs(
+                        Style.wrap(
+                            "Masks single blocks instead of whole 16x16x16 sections: every block that no line of sight from the",
+                            "player's possible camera positions can reach is sent as stone, caves, rooms and ores right next to",
+                            "the player included, unless they are open to the sky. Updates of blocks that can't be seen right now",
+                            "are withheld until they can. Costs more worker CPU (a few milliseconds per update at view distance",
+                            "10) and re-sends chunks more often when players dig into or walk through caves"
+                        )
+                    );
             }
 
             public boolean enabled = false;
             public double revealMargin = 8.0D;
             public int maxResendsPerTick = 8;
             public int updateIntervalTicks = 10;
+            public boolean perBlock = false;
         }
 
         {

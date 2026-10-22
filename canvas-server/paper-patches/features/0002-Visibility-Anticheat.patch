@@ -6,8 +6,27 @@ Subject: [PATCH] Visibility Anticheat
 Registers the bypass permissions of Canvas' visibility anticheat with a
 default of false, so operators aren't silently exempt.
 
+diff --git a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java
+index 819d4d0307f53e40cb5de3fc6517771e0b3fe859..cfb879aa5dbac3193ea5ab737886012328161019 100644
+--- a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java
++++ b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java
+@@ -43,4 +43,14 @@ public class ChunkPacketBlockController {
+     public void onPlayerLeftClickBlock(Level level, BlockPos blockPos, ServerboundPlayerActionPacket.Action action, Direction direction, int worldHeight, int sequence) {
+ 
+     }
++
++    // Canvas start - visibility anticheat
++    /**
++     * Whether blocks of the given state may be sent as another block in chunk packets of players this controller
++     * modifies chunks for, so that only a chunk packet may reveal them to such a player.
++     */
++    public boolean canvas$mayObfuscate(Level level, BlockState state) {
++        return false;
++    }
++    // Canvas end - visibility anticheat
+ }
 diff --git a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
-index 86e7f42bd8ba10ec92a18889effa4b341edebc47..157a9681f274c30d1889463d52a6b2e87810f699 100644
+index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf997517eed 100644
 --- a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
 +++ b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
 @@ -176,9 +176,29 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
@@ -67,9 +86,19 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..157a9681f274c30d1889463d52a6b2e8
          chunkPacketInfoAntiXray.getChunkPacket().setReady(true);
      }
  
-@@ -666,6 +698,10 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+@@ -665,7 +697,20 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+         }
      }
  
++    // Canvas start - visibility anticheat
++    @Override
++    public boolean canvas$mayObfuscate(Level level, BlockState state) {
++        final io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation rayTraceObfuscation = this.rayTraceObfuscation(level);
++        final boolean[] obfuscateGlobal = rayTraceObfuscation == null ? this.obfuscateGlobal : rayTraceObfuscation.obfuscateGlobal();
++        return obfuscateGlobal[GLOBAL_BLOCKSTATE_PALETTE.idFor(state, PaletteResize.noResizeExpected())];
++    }
++    // Canvas end - visibility anticheat
++
      private void updateBlock(Level level, BlockPos blockPos) {
 +        // Canvas start - visibility anticheat - traced blocks are hidden like paper's hidden blocks while they aren't exposed
 +        final io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation rayTraceObfuscation = this.rayTraceObfuscation(level);

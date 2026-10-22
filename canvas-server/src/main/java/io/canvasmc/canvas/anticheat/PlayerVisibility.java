@@ -385,8 +385,8 @@ public final class PlayerVisibility {
 
     /**
      * Whether the given state of the block must not be sent to this player right now, because the block is hidden
-     * by the ray traced anti-xray or lies in a section masked by anti-freecam. Used to filter block updates, block
-     * entity data and block events.
+     * by the ray traced anti-xray or masked by anti-freecam (which, per block, also withholds updates of blocks that
+     * can't be seen right now). Used to filter block updates, block entity data and block events.
      * <p>
      * This may be called from any thread, as block events are broadcast to players of other regions too. The answer
      * may then be slightly stale, which is harmless since revealing always sends the current state.
@@ -395,7 +395,7 @@ public final class PlayerVisibility {
      */
     public boolean isBlockHidden(final int x, final int y, final int z, final BlockState state) {
         try {
-            return this.antiXray.isHidden(x, y, z, state) || this.antiFreecam.isMasked(x, y, z);
+            return this.antiXray.isHidden(x, y, z, state) || this.antiFreecam.withholdsUpdate(x, y, z);
         } catch (final RuntimeException thrown) {
             this.failed("isBlockHidden", thrown);
             return false;
@@ -408,7 +408,7 @@ public final class PlayerVisibility {
      */
     public boolean mayHideInSection(final int chunkX, final int sectionY, final int chunkZ) {
         try {
-            return this.antiFreecam.isSectionMasked(chunkX, sectionY, chunkZ) || this.antiXray.mayHideInSection(chunkX, sectionY, chunkZ);
+            return this.antiFreecam.mayHideIn(chunkX, sectionY, chunkZ) || this.antiXray.mayHideInSection(chunkX, sectionY, chunkZ);
         } catch (final RuntimeException thrown) {
             this.failed("mayHideInSection", thrown);
             // isBlockHidden decides
@@ -458,13 +458,14 @@ public final class PlayerVisibility {
             final int x = pos.getX();
             final int y = pos.getY();
             final int z = pos.getZ();
-            // filler only matters in the corridor the piston pushes or pulls along: elsewhere it is part of a masked
-            // section, which is sent again as a whole once it can be seen
+            // filler only matters in the corridor the piston pushes or pulls along, and only where the real block
+            // doesn't move like the filler: elsewhere the client gets the real blocks once they can be seen
             final int endX = x + facing.getStepX() * reach;
             final int endY = y + facing.getStepY() * reach;
             final int endZ = z + facing.getStepZ() * reach;
-            if (this.antiFreecam.anySectionMasked((Math.min(x, endX) - 1) >> 4, (Math.min(y, endY) - 1) >> 4, (Math.min(z, endZ) - 1) >> 4,
-                (Math.max(x, endX) + 1) >> 4, (Math.max(y, endY) + 1) >> 4, (Math.max(z, endZ) + 1) >> 4)) {
+            if (this.antiFreecam.anyHidden(Math.min(x, endX) - 1, Math.min(y, endY) - 1, Math.min(z, endZ) - 1,
+                Math.max(x, endX) + 1, Math.max(y, endY) + 1, Math.max(z, endZ) + 1,
+                (final int hiddenX, final int hiddenY, final int hiddenZ) -> !VisibilityFilters.movesLikeFiller(level, hiddenX, hiddenY, hiddenZ))) {
                 return true;
             }
             return this.antiXray.anyHidden(level, x - reach, y - reach, z - reach, x + reach, y + reach, z + reach,
@@ -500,6 +501,18 @@ public final class PlayerVisibility {
         } catch (final RuntimeException thrown) {
             this.failed("filterLightUpdate", thrown);
             return packet;
+        }
+    }
+
+    /**
+     * Called when a block of a chunk sent to this player changed between occluding and not occluding, on the thread
+     * owning the block.
+     */
+    public void onOpacityChange(final ServerLevel level, final BlockPos pos, final boolean opaque) {
+        try {
+            this.antiFreecam.onOpacityChange(level, pos, opaque);
+        } catch (final RuntimeException thrown) {
+            this.failed("onOpacityChange", thrown);
         }
     }
 
