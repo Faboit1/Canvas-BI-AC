@@ -75,6 +75,104 @@ index fa322df502d1e6c6d603730372c572f62e70306a..080f170d3f8b19b09899097adafffd13
              player.connection.send(refreshPackets.computeIfAbsent(shouldModify, s -> { // Use connection to prevent creating firing event
                  return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, (Boolean) s);
              }));
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index 9c83ad4d41a8b97331c94e3ea260e04096caca5b..1d3f5d98c24771b1cf09eb8cb4585803e286748a 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -456,6 +456,15 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+             && (packet.getExtraPackets() == null || packet.getExtraPackets().isEmpty())))) {
+             this.sendPacket(packet, listener, flush);
+         } else {
++            // Canvas start - visibility anticheat
++            if (!packet.isReady()) {
++                // anti-xray may still remove extra packets (block entities of hidden blocks) while it obfuscates the
++                // packet, they are collected once it is ready
++                this.pendingActions.add(new DeferredExtraPacketsSendAction(packet, listener, flush));
++                this.flushQueue();
++                return;
++            }
++            // Canvas end - visibility anticheat
+             // Write the packets to the queue, then flush - antixray hooks there already
+             final java.util.List<Packet<?>> extraPackets = InnerUtil.buildExtraPackets(packet);
+             final boolean hasExtraPackets = extraPackets != null && !extraPackets.isEmpty();
+@@ -599,7 +608,8 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+     private final java.util.concurrent.atomic.AtomicBoolean flushingQueue = new java.util.concurrent.atomic.AtomicBoolean();
+ 
+     private static boolean canWrite(final WrappedConsumer queued) {
+-        return queued != null && (!(queued instanceof PacketSendAction packet) || packet.packet.isReady());
++        return queued != null && (!(queued instanceof PacketSendAction packet) || packet.packet.isReady())
++            && (!(queued instanceof DeferredExtraPacketsSendAction deferred) || deferred.packet.isReady()); // Canvas - visibility anticheat
+     }
+ 
+     private boolean canWritePackets() {
+@@ -1010,6 +1020,7 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+         final net.minecraft.server.level.ServerPlayer player = getPlayer();
+         // Folia start - region threading - connection fixes
+         final java.util.List<Connection.PacketSendAction> queuedPackets = new java.util.ArrayList<>();
++        final java.util.List<Packet<?>> deferredPackets = new java.util.ArrayList<>(); // Canvas - visibility anticheat
+ 
+         // synchronise so that flushQueue does not poll values while the queue is being cleared
+         synchronized (this.pendingActions) {
+@@ -1018,6 +1029,12 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+                 if (consumer instanceof Connection.PacketSendAction packetHolder) {
+                     queuedPackets.add(packetHolder);
+                 }
++                // Canvas start - visibility anticheat
++                else if (consumer instanceof Connection.DeferredExtraPacketsSendAction deferred) {
++                    // the extra packets may still be changing, they don't have finish listeners
++                    deferredPackets.add(deferred.packet);
++                }
++                // Canvas end - visibility anticheat
+             }
+         }
+ 
+@@ -1027,6 +1044,13 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+                 packet.onPacketDispatchFinish(player, null);
+             }
+         }
++        // Canvas start - visibility anticheat
++        for (final Packet<?> packet : deferredPackets) {
++            if (packet.hasFinishListener()) {
++                packet.onPacketDispatchFinish(player, null);
++            }
++        }
++        // Canvas end - visibility anticheat
+         // Folia end - region threading - connection fixes
+     }
+ 
+@@ -1106,5 +1130,32 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+             this.packet = packet;
+         }
+     }
++
++    // Canvas start - visibility anticheat
++    /**
++     * Sends a packet that wasn't ready when it was queued, followed by its extra packets, which are only collected
++     * once the packet is ready.
++     */
++    private static final class DeferredExtraPacketsSendAction extends WrappedConsumer {
++        private final Packet<?> packet;
++
++        private DeferredExtraPacketsSendAction(final Packet<?> packet, @Nullable final ChannelFutureListener channelFutureListener, final boolean flush) {
++            super(connection -> {
++                final java.util.List<Packet<?>> extraPackets = InnerUtil.buildExtraPackets(packet);
++                if (extraPackets == null || extraPackets.isEmpty()) {
++                    connection.sendPacket(packet, channelFutureListener, flush);
++                    return;
++                }
++                connection.sendPacket(packet, null, false); // Delay the future listener until the end of the extra packets
++                for (int i = 0, len = extraPackets.size(); i < len;) {
++                    final Packet<?> extraPacket = extraPackets.get(i);
++                    final boolean end = ++i == len;
++                    connection.sendPacket(extraPacket, end ? channelFutureListener : null, end); // Append listener to the end
++                }
++            });
++            this.packet = packet;
++        }
++    }
++    // Canvas end - visibility anticheat
+     // Paper end - Optimize network
+ }
 diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..7d9e10350a2af790fcccf2012ab50dbdb106f291 100644
 --- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
@@ -286,7 +384,7 @@ index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..96bbff01a7f637362b4baa85d4a211b8
  
      private ClientboundSectionBlocksUpdatePacket(final FriendlyByteBuf input) {
 diff --git a/net/minecraft/server/level/ChunkHolder.java b/net/minecraft/server/level/ChunkHolder.java
-index cd5a325d37f617431ceb568a655701601618198f..3e70b64e4f7fbc6242fce44c26eb74f63da5b21c 100644
+index cd5a325d37f617431ceb568a655701601618198f..5af890d43efc9a5b4f3676aca1bfc014308ad5b4 100644
 --- a/net/minecraft/server/level/ChunkHolder.java
 +++ b/net/minecraft/server/level/ChunkHolder.java
 @@ -281,7 +281,7 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
@@ -298,7 +396,7 @@ index cd5a325d37f617431ceb568a655701601618198f..3e70b64e4f7fbc6242fce44c26eb74f6
                  }
  
                  this.skyChangedLightSectionFilter.clear();
-@@ -301,13 +301,18 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
+@@ -301,13 +301,22 @@ public class ChunkHolder extends GenerationChunkHolder implements ca.spottedleaf
                              if (changedBlocks.size() == 1) {
                                  BlockPos pos = sectionPos.relativeToBlockPos(changedBlocks.iterator().nextShort());
                                  BlockState state = level.getBlockState(pos);
@@ -316,7 +414,11 @@ index cd5a325d37f617431ceb568a655701601618198f..3e70b64e4f7fbc6242fce44c26eb74f6
 -                                packet.runUpdates((pos, state) -> this.broadcastBlockEntityIfNeeded(players, level, pos, state));
 +                                // Canvas start - visibility anticheat
 +                                io.canvasmc.canvas.anticheat.VisibilityFilters.broadcastSectionUpdate(players, packet);
-+                                packet.runUpdates((pos, state) -> this.broadcastBlockEntityIfNeeded(io.canvasmc.canvas.anticheat.VisibilityFilters.receiversOf(players, pos, state), level, pos, state));
++                                packet.runUpdates((pos, state) -> {
++                                    if (state.hasBlockEntity()) {
++                                        this.broadcastBlockEntity(io.canvasmc.canvas.anticheat.VisibilityFilters.receiversOf(players, pos, state), level, pos);
++                                    }
++                                });
 +                                // Canvas end - visibility anticheat
                              }
                          }
@@ -437,6 +539,55 @@ index dbb1b7c78a2e4cd62e1e9f4d54d0209a1c0b88a0..42842741df042eab87497f96ab8c1d2b
      public final io.canvasmc.canvas.world.RegionResourceBar.DisplayManager canvas$ramBarDisplay = io.canvasmc.canvas.world.RegionResourceBar.DisplayManager.createNew(this, net.kyori.adventure.bossbar.BossBar.Color.GREEN); // Canvas - rambar
      public final int canvas$infoBucketIndex; // Canvas - optimize playerlist tick
      public boolean isRealPlayer; // Paper
+diff --git a/net/minecraft/server/level/ServerPlayerGameMode.java b/net/minecraft/server/level/ServerPlayerGameMode.java
+index ad051850f61f2c9dbcd2922a366098797c521c21..c43aafe839b61e856e45fe6ee91393d75c57a2f0 100644
+--- a/net/minecraft/server/level/ServerPlayerGameMode.java
++++ b/net/minecraft/server/level/ServerPlayerGameMode.java
+@@ -200,7 +200,7 @@ public class ServerPlayerGameMode {
+ 
+             this.debugLogging(pos, false, sequence, "too far");
+         } else if (pos.getY() > maxY) {
+-            this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
++            this.player.connection.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, this.level, pos)); // Canvas - visibility anticheat
+             this.debugLogging(pos, false, sequence, "too high");
+         } else {
+             if (action == ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK) {
+@@ -213,7 +213,7 @@ public class ServerPlayerGameMode {
+                 if (!this.level.mayInteract(this.player, pos)) {
+                     // CraftBukkit start - fire PlayerInteractEvent
+                     org.bukkit.craftbukkit.event.CraftEventFactory.callPlayerInteractEvent(this.player, org.bukkit.event.block.Action.LEFT_CLICK_BLOCK, pos, direction, this.player.getInventory().getSelectedItem(), InteractionHand.MAIN_HAND);
+-                    this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
++                    this.player.connection.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, this.level, pos)); // Canvas - visibility anticheat
+                     this.debugLogging(pos, false, sequence, "may not interact");
+                     this.capturedBlockEntity = true; // Paper - Send block entities after destroy prediction
+                     // CraftBukkit end
+@@ -241,7 +241,7 @@ public class ServerPlayerGameMode {
+                 // Spigot end
+ 
+                 if (this.player.blockActionRestricted(this.level, pos, this.gameModeForPlayer)) {
+-                    this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
++                    this.player.connection.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, this.level, pos)); // Canvas - visibility anticheat
+                     this.debugLogging(pos, false, sequence, "block action restricted");
+                     return;
+                 }
+@@ -285,7 +285,7 @@ public class ServerPlayerGameMode {
+                     this.destroyAndAck(pos, sequence, "insta mine");
+                 } else {
+                     if (this.isDestroyingBlock) {
+-                        this.player.connection.send(new ClientboundBlockUpdatePacket(this.destroyPos, this.level.getBlockState(this.destroyPos)));
++                        this.player.connection.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, this.level, this.destroyPos)); // Canvas - visibility anticheat
+                         this.debugLogging(pos, false, sequence, "abort destroying since another started (client insta mine, server disagreed)");
+                     }
+ 
+@@ -353,7 +353,7 @@ public class ServerPlayerGameMode {
+         if (this.destroyBlock(pos)) {
+             this.debugLogging(pos, true, sequence, exitId);
+         } else {
+-            this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
++            this.player.connection.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, this.level, pos)); // Canvas - visibility anticheat
+             this.debugLogging(pos, false, sequence, exitId);
+         }
+     }
 diff --git a/net/minecraft/server/network/PlayerChunkSender.java b/net/minecraft/server/network/PlayerChunkSender.java
 index 196c01fe5f200ed57e6f23e0939cac616305571a..a0f573b298724ccba1fc806df50ee570bf580875 100644
 --- a/net/minecraft/server/network/PlayerChunkSender.java
@@ -455,10 +606,26 @@ index 196c01fe5f200ed57e6f23e0939cac616305571a..a0f573b298724ccba1fc806df50ee570
          // Paper start - PlayerChunkLoadEvent
          if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index 8adc35cc39e0580b938c6331fc5c2d5b85aee5fd..5eae44fd6a775f81e36e2f08c1f7b602bd5e2eea 100644
+index 8adc35cc39e0580b938c6331fc5c2d5b85aee5fd..a02b65c086358ee7aa55ee148764d30af768cb1f 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-@@ -2131,6 +2131,7 @@ public class ServerGamePacketListenerImpl
+@@ -1963,7 +1963,14 @@ public class ServerGamePacketListenerImpl
+                 .distinct()
+                 .forEach(blockPos -> {
+                     ServerLevel level = this.player.level();
+-                    this.send(new ClientboundBlockUpdatePacket(level, blockPos));
++                    // Canvas start - visibility anticheat
++                    final BlockState blockState = level.getBlockState(blockPos);
++                    if (this.player.canvas$visibility.isBlockHidden(blockPos.getX(), blockPos.getY(), blockPos.getZ(), blockState)) {
++                        this.send(new ClientboundBlockUpdatePacket(blockPos, io.canvasmc.canvas.anticheat.VisibilityFilters.hideBlock(level, blockPos.getY())));
++                        return;
++                    }
++                    this.send(new ClientboundBlockUpdatePacket(blockPos, blockState));
++                    // Canvas end - visibility anticheat
+                     BlockEntity blockEntity = level.getBlockEntity(blockPos);
+                     if (blockEntity != null) {
+                         Packet<?> packet = blockEntity.getUpdatePacket();
+@@ -2131,6 +2138,7 @@ public class ServerGamePacketListenerImpl
          this.lastYRot = this.player.getYRot();
          this.lastXRot = this.player.getXRot();
          // CraftBukkit end
@@ -466,6 +633,19 @@ index 8adc35cc39e0580b938c6331fc5c2d5b85aee5fd..5eae44fd6a775f81e36e2f08c1f7b602
          this.send(ClientboundPlayerPositionPacket.of(this.awaitingTeleport, destination, relatives));
      }
  
+@@ -2372,8 +2380,10 @@ public class ServerGamePacketListenerImpl
+                                 // this.player.sendBuildLimitMessage(true, maxY); // Paper - Fix MC-306582: Fix build limit message being sent when it shouldn't be
+                             }
+ 
+-                            this.send(new ClientboundBlockUpdatePacket(level, pos));
+-                            this.send(new ClientboundBlockUpdatePacket(level, pos.relative(direction)));
++                            // Canvas start - visibility anticheat
++                            this.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, level, pos));
++                            this.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, level, pos.relative(direction)));
++                            // Canvas end - visibility anticheat
+                         }
+                         if (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.updateEquipmentOnPlayerActions) this.player.detectEquipmentUpdates(); // Paper - Force update attributes.
+                         // Paper - Remove unused warning
 diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
 index 2a19cf8a3ca35bcb1a7cab901ca90361441cf78f..35bce8471a8d3190f4a35fe5b14d483effadd0c1 100644
 --- a/net/minecraft/world/entity/Entity.java

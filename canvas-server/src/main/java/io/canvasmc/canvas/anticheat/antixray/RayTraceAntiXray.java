@@ -14,6 +14,8 @@ import io.canvasmc.canvas.anticheat.raytrace.OcclusionCache;
 import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
 import io.papermc.paper.antixray.ChunkPacketInfo;
 import io.papermc.paper.antixray.ChunkPacketInfoAntiXray;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.longs.Long2ReferenceLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
@@ -56,6 +58,10 @@ public final class RayTraceAntiXray implements VisibilityModule {
     private static final VarHandle BITS = MethodHandles.arrayElementVarHandle(long[].class);
     private static final Set<ResourceKey<Level>> WARNED_LEVELS = ConcurrentHashMap.newKeySet();
     private static final int[] NO_POSITIONS = new int[0];
+    /**
+     * Blocks revealed per tick after the module was deactivated for a player.
+     */
+    private static final int DEACTIVATION_REVEALS_PER_TICK = 512;
     private static final long[] NO_BITS = new long[0];
 
     /**
@@ -97,6 +103,11 @@ public final class RayTraceAntiXray implements VisibilityModule {
 
     // region thread state
     private final ArrayList<TrackedChunk> pending = new ArrayList<>();
+    /**
+     * Chunks that still had hidden blocks when the module was deactivated, their blocks are revealed over the next
+     * ticks.
+     */
+    private final Long2ReferenceLinkedOpenHashMap<TrackedChunk> deactivated = new Long2ReferenceLinkedOpenHashMap<>();
     private boolean needsPass;
     private double passX = Double.NaN;
     private double passY;
@@ -153,7 +164,14 @@ public final class RayTraceAntiXray implements VisibilityModule {
                 }
             }
             this.pending.removeIf((final TrackedChunk tracked) -> tracked.level != level);
+            this.deactivated.clear();
         } else {
+            // deactivated (bypass granted, disabled by a reload): the client still shows the hidden blocks, they are
+            // revealed over the next ticks. Updates of them go through from now on
+            for (final Iterator<TrackedChunk> iterator = this.chunks.valueIterator(); iterator.hasNext(); ) {
+                final TrackedChunk tracked = iterator.next();
+                this.deactivated.put(tracked.key, tracked);
+            }
             this.chunks.clear();
             this.pending.clear();
         }
@@ -161,10 +179,64 @@ public final class RayTraceAntiXray implements VisibilityModule {
         this.needsPass = true;
     }
 
+    @Override
+    public void tickInactive() {
+        final ServerLevel level = this.owner.player.level();
+        int budget = DEACTIVATION_REVEALS_PER_TICK;
+        while (budget > 0 && !this.deactivated.isEmpty()) {
+            final TrackedChunk tracked = this.deactivated.get(this.deactivated.firstLongKey());
+            final ChunkPacketInfoAntiXray info = tracked.info;
+            if (info != null && !info.getChunkPacket().isReady()) {
+                // still being obfuscated, which won't take long
+                return;
+            }
+            this.deactivated.removeFirst();
+            final LevelChunk chunk = tracked.level == level ? this.ownedChunk(tracked) : null;
+            if (chunk == null) {
+                // the client forgot the chunk
+                continue;
+            }
+            if (info != null) {
+                final int[] positions = info.getRayTraceHidden();
+                if (positions != null) {
+                    for (final int packed : positions) {
+                        this.sendRealState(chunk, tracked.blockPos(packed));
+                    }
+                    budget -= positions.length;
+                }
+                continue;
+            }
+            final int[] positions = tracked.positions;
+            final long[] hidden = tracked.hidden;
+            for (int i = 0; i < positions.length; ++i) {
+                if ((hidden[i >>> 6] & 1L << i) != 0L) {
+                    this.sendRealState(chunk, tracked.blockPos(positions[i]));
+                    --budget;
+                }
+            }
+        }
+    }
+
+    @Override
+    public void tick(final CameraSnapshot snapshot) {
+        if (this.deactivated.isEmpty()) {
+            return;
+        }
+        // activated again before everything was revealed, the rest is still hidden
+        for (final TrackedChunk tracked : this.deactivated.values()) {
+            if (tracked.level == snapshot.level && this.chunks.putIfAbsent(tracked.key, tracked) == null && tracked.info != null) {
+                this.pending.add(tracked);
+            }
+        }
+        this.deactivated.clear();
+        this.needsPass = true;
+    }
+
     // chunk tracking
 
     public void onChunkSent(final LevelChunk chunk, final ClientboundLevelChunkWithLightPacket packet) {
         final long key = CoordinateUtils.getChunkKey(chunk.getPos());
+        this.deactivated.remove(key);
         final ChunkPacketInfo<BlockState> info = packet.chunkData().canvas$chunkPacketInfo;
         if (!(info instanceof final ChunkPacketInfoAntiXray antiXrayInfo) || antiXrayInfo.getRayTraceObfuscation() == null) {
             // sent without ray traced blocks, e.g. to a bypassing player
@@ -179,7 +251,9 @@ public final class RayTraceAntiXray implements VisibilityModule {
     }
 
     public void onChunkUnload(final int chunkX, final int chunkZ) {
-        this.chunks.remove(CoordinateUtils.getChunkKey(chunkX, chunkZ));
+        final long key = CoordinateUtils.getChunkKey(chunkX, chunkZ);
+        this.chunks.remove(key);
+        this.deactivated.remove(key);
     }
 
     /**
@@ -205,34 +279,43 @@ public final class RayTraceAntiXray implements VisibilityModule {
             hidden[hidden.length - 1] = (1L << positions.length) - 1L;
         }
 
-        final LongArrayList updates;
+        IntArrayList wronglyWithheld = null;
         synchronized (tracked) {
+            final LongArrayList updates = tracked.pendingUpdates;
+            tracked.pendingUpdates = null;
+            if (updates != null) {
+                // in order, the last update of a position decides what the client has
+                for (int i = 0, len = updates.size(); i < len; ++i) {
+                    final long update = updates.getLong(i);
+                    final int packed = (int) (update >> 1);
+                    final boolean withheld = (update & 1L) != 0L;
+                    final int index = Arrays.binarySearch(positions, packed);
+                    if (index >= 0) {
+                        // withheld updates keep the position hidden, the next reveal sends the real state. Otherwise
+                        // the client got a state that isn't hidden anymore
+                        final long bit = 1L << index;
+                        hidden[index >>> 6] = withheld ? hidden[index >>> 6] | bit : hidden[index >>> 6] & ~bit;
+                    } else if (withheld) {
+                        if (wronglyWithheld == null) {
+                            wronglyWithheld = new IntArrayList();
+                        }
+                        wronglyWithheld.add(packed);
+                    }
+                }
+            }
             tracked.positions = positions;
             tracked.hidden = hidden;
             tracked.hiddenSections = tracked.sectionsOf(true);
-            // publishes the fields above
+            // publishes the fields above, updates that see the cleared info use them instead of being recorded
             tracked.info = null;
-            updates = tracked.pendingUpdates;
-            tracked.pendingUpdates = null;
         }
 
-        if (updates != null) {
-            for (int i = 0, len = updates.size(); i < len; ++i) {
-                final long update = updates.getLong(i);
-                final int packed = (int) (update >> 1);
-                final boolean withheld = (update & 1L) != 0L;
-                final int index = Arrays.binarySearch(positions, packed);
-                if (index >= 0) {
-                    if (!withheld) {
-                        // the client got a state that isn't hidden anymore
-                        BITS.getAndBitwiseAnd(hidden, index >>> 6, ~(1L << index));
-                    }
-                } else if (withheld) {
-                    // turned out not to be hidden, the client must learn about the change after all
-                    final LevelChunk chunk = this.ownedChunk(tracked);
-                    if (chunk != null) {
-                        this.sendRealState(chunk, tracked.blockPos(packed));
-                    }
+        if (wronglyWithheld != null) {
+            // turned out not to be hidden, the client must learn about the changes after all
+            final LevelChunk chunk = this.ownedChunk(tracked);
+            if (chunk != null) {
+                for (int i = 0, len = wronglyWithheld.size(); i < len; ++i) {
+                    this.sendRealState(chunk, tracked.blockPos(wronglyWithheld.getInt(i)));
                 }
             }
         }
@@ -356,22 +439,24 @@ public final class RayTraceAntiXray implements VisibilityModule {
     }
 
     @Override
+    public boolean isLatencySensitive() {
+        // passes can take a while, blocks being revealed a little later is better than entities popping in late
+        return false;
+    }
+
+    @Override
     public void runAsync(final CameraSnapshot snapshot, final OcclusionAccess access) {
         // a discarded job may have left references behind
         Arrays.fill(this.resultChunks, 0, this.resultCount, null);
         this.resultCount = 0;
 
-        // the access is shared with the other modules of the job
+        // the client's camera isn't stopped by lava, the cameras are shared with the other modules
+        final double @Nullable [] cameras = this.jobThirdPerson ? snapshot.cameras(access) : null;
         access.setLavaObscures(this.jobLavaObscures);
-        try {
-            this.trace(snapshot, access);
-        } finally {
-            access.setLavaObscures(false);
-        }
+        this.trace(snapshot, access, cameras);
     }
 
-    private void trace(final CameraSnapshot snapshot, final OcclusionAccess access) {
-        final double[] cameras = this.jobThirdPerson ? snapshot.cameras(access) : null;
+    private void trace(final CameraSnapshot snapshot, final OcclusionAccess access, final double @Nullable [] cameras) {
         // rays end at the cameras, so the cells around the eyes are read over and over
         final OcclusionCache cache = OcclusionCache.get(access, snapshot.eyeX, snapshot.eyeY, snapshot.eyeZ);
         final double distance = this.jobDistance;
@@ -701,13 +786,10 @@ public final class RayTraceAntiXray implements VisibilityModule {
         boolean isHiddenWhilePending(final ChunkPacketInfoAntiXray info, final int packed, final BlockState state) {
             final boolean traced = this.obfuscation.isTraced(state);
             if (info.getChunkPacket().isReady()) {
-                // every recorded position starts hidden
+                // every recorded position starts hidden, updates of other positions are never hidden
                 final int[] positions = info.getRayTraceHidden();
                 if (positions == null || Arrays.binarySearch(positions, packed) < 0) {
                     return false;
-                }
-                if (traced) {
-                    return true;
                 }
             }
             LongArrayList updates = this.pendingUpdates;

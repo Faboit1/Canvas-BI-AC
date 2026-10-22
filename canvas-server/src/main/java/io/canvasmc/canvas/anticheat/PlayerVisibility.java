@@ -10,6 +10,7 @@ import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -19,10 +20,10 @@ import org.jspecify.annotations.Nullable;
 /**
  * Per-player state of Canvas' native visibility anticheat, owned by {@link ServerPlayer}.
  * <p>
- * Everything here runs on the region thread owning the player, except the job submitted to
- * {@link AnticheatExecutor}. A player has at most one job in flight: each tick the results of a finished job are
- * applied first, then, if no job is running, every active module is asked whether it needs asynchronous work, and a
- * single job running all of them is submitted with a fresh {@link CameraSnapshot}.
+ * Everything here runs on the region thread owning the player, except the jobs submitted to
+ * {@link AnticheatExecutor}. Every module has at most one job in flight per player: each tick the results of finished
+ * jobs are applied first, then every active module without a running job is asked whether it needs asynchronous work,
+ * and a job is submitted for each that does, all sharing a fresh {@link CameraSnapshot}.
  * <p>
  * All entry points used by the server internals live here, so the patched vanilla code only ever talks to this
  * class.
@@ -50,15 +51,10 @@ public final class PlayerVisibility {
     // region thread state
     private long epoch;
     private @Nullable ServerLevel lastLevel;
-    private boolean jobInFlight;
-    private @Nullable CameraSnapshot jobSnapshot;
-    private final boolean[] jobModules;
+    private final Job[] jobs;
     private double lastEyeX = Double.NaN;
     private double lastEyeY;
     private double lastEyeZ;
-
-    // written by the worker, read by the region thread
-    private volatile boolean jobDone;
 
     // bypass permissions, refreshed periodically since permission checks aren't free
     private int nextPermissionRefresh = Integer.MIN_VALUE;
@@ -75,7 +71,10 @@ public final class PlayerVisibility {
         this.undergroundViewDistance = new UndergroundViewDistance(this);
         this.modules = new VisibilityModule[] {this.antiXray, this.antiEsp, this.antiFreecam};
         this.moduleActive = new boolean[this.modules.length];
-        this.jobModules = new boolean[this.modules.length];
+        this.jobs = new Job[this.modules.length];
+        for (int i = 0; i < this.jobs.length; ++i) {
+            this.jobs[i] = new Job(this.modules[i]);
+        }
     }
 
     /**
@@ -133,7 +132,7 @@ public final class PlayerVisibility {
         for (int i = 0; i < this.modules.length; ++i) {
             final boolean active = this.modules[i].isActive(config);
             if (!active && this.moduleActive[i]) {
-                // results of a running job must not be applied after the reset
+                // results of running jobs must not be applied after the reset
                 ++this.epoch;
                 this.modules[i].reset();
             }
@@ -141,16 +140,14 @@ public final class PlayerVisibility {
         }
         this.undergroundViewDistance.tick(config.undergroundViewDistance);
 
-        if (this.jobInFlight && this.jobDone) {
-            this.jobInFlight = false;
-            this.jobDone = false;
-            final CameraSnapshot jobSnapshot = this.jobSnapshot;
-            this.jobSnapshot = null;
-            if (jobSnapshot != null && jobSnapshot.epoch == this.epoch) {
-                for (int i = 0; i < this.modules.length; ++i) {
-                    if (this.jobModules[i] && this.moduleActive[i]) {
-                        this.modules[i].applyResults(jobSnapshot);
-                    }
+        for (int i = 0; i < this.modules.length; ++i) {
+            final Job job = this.jobs[i];
+            if (job.snapshot != null && job.done) {
+                final CameraSnapshot jobSnapshot = job.snapshot;
+                job.snapshot = null;
+                job.done = false;
+                if (jobSnapshot.epoch == this.epoch && this.moduleActive[i]) {
+                    this.modules[i].applyResults(jobSnapshot);
                 }
             }
         }
@@ -159,42 +156,27 @@ public final class PlayerVisibility {
         for (int i = 0; i < this.modules.length; ++i) {
             if (this.moduleActive[i]) {
                 this.modules[i].tick(snapshot);
+            } else {
+                this.modules[i].tickInactive();
             }
         }
-        if (this.jobInFlight) {
-            return;
-        }
 
-        boolean any = false;
         for (int i = 0; i < this.modules.length; ++i) {
-            final boolean run = this.moduleActive[i] && this.modules[i].prepareAsync(snapshot);
-            this.jobModules[i] = run;
-            any |= run;
+            final Job job = this.jobs[i];
+            if (job.snapshot == null && this.moduleActive[i] && this.modules[i].prepareAsync(snapshot)) {
+                job.snapshot = snapshot;
+                AnticheatExecutor.execute(() -> this.runJob(job, snapshot), this.modules[i].isLatencySensitive());
+            }
         }
-        if (!any) {
-            return;
-        }
-
-        this.jobInFlight = true;
-        this.jobSnapshot = snapshot;
-        AnticheatExecutor.get().execute(() -> this.runJob(snapshot));
     }
 
-    private void runJob(final CameraSnapshot snapshot) {
+    private void runJob(final Job job, final CameraSnapshot snapshot) {
         try {
-            final OcclusionAccess access = new OcclusionAccess(snapshot.level);
-            for (int i = 0; i < this.modules.length; ++i) {
-                if (!this.jobModules[i]) {
-                    continue;
-                }
-                try {
-                    this.modules[i].runAsync(snapshot, access);
-                } catch (final Throwable thrown) {
-                    AnticheatExecutor.LOGGER.error("Visibility job of {} failed for player {}", this.modules[i].getClass().getSimpleName(), this.player.getScoreboardName(), thrown);
-                }
-            }
+            job.module.runAsync(snapshot, new OcclusionAccess(snapshot.level));
+        } catch (final Throwable thrown) {
+            AnticheatExecutor.LOGGER.error("Visibility job of {} failed for player {}", job.module.getClass().getSimpleName(), this.player.getScoreboardName(), thrown);
         } finally {
-            this.jobDone = true;
+            job.done = true;
         }
     }
 
@@ -222,8 +204,20 @@ public final class PlayerVisibility {
             this.player.getYRot(), this.player.getXRot(),
             look.x, look.y, look.z,
             velocityX, velocityY, velocityZ,
-            this.player.getAttributeValue(Attributes.CAMERA_DISTANCE)
+            this.cameraDistance()
         );
+    }
+
+    /**
+     * The maximum distance of the third person camera from the eyes. The client scales the camera distance attribute by
+     * the entity's scale, and uses the vehicle's when that's further away (a happy ghast's camera is further back).
+     */
+    private double cameraDistance() {
+        double ret = this.player.getAttributeValue(Attributes.CAMERA_DISTANCE) * this.player.getScale();
+        if (this.player.getVehicle() instanceof final LivingEntity vehicle) {
+            ret = Math.max(ret, vehicle.getAttributeValue(Attributes.CAMERA_DISTANCE) * vehicle.getScale());
+        }
+        return ret;
     }
 
     /**
@@ -370,15 +364,15 @@ public final class PlayerVisibility {
     }
 
     /**
-     * Whether anti-ESP currently hides the entity from this player, i.e. the entity tracker doesn't send it to them.
-     * Used to keep other packets about the entity (like its block breaking progress) away from this player.
+     * Whether anti-ESP or anti-freecam currently hide the entity from this player, i.e. the entity tracker doesn't
+     * send it to them. Used to keep other packets about the entity (like its block breaking progress) away from this
+     * player.
      */
     public boolean isEntityHidden(final Entity entity) {
-        if (entity == this.player || !this.isActive(this.antiEsp)) {
+        if (entity == this.player) {
             return false;
         }
-        final net.minecraft.server.level.ChunkMap.TrackedEntity tracker = entity.moonrise$getTrackedEntity();
-        return tracker != null && !tracker.seenBy.contains(this.player.connection);
+        return this.antiFreecam.isEntityMasked(entity) || (this.isActive(this.antiEsp) && this.antiEsp.isHidden(entity));
     }
 
     /**
@@ -403,5 +397,20 @@ public final class PlayerVisibility {
      */
     public int sendDistanceCap() {
         return this.undergroundViewDistance.sendDistanceCap();
+    }
+
+    /**
+     * The job of one module. {@link #snapshot} is set on the region thread while the job is in flight, {@link #done}
+     * is set by the worker once it finished.
+     */
+    private static final class Job {
+
+        final VisibilityModule module;
+        @Nullable CameraSnapshot snapshot;
+        volatile boolean done;
+
+        Job(final VisibilityModule module) {
+            this.module = module;
+        }
     }
 }

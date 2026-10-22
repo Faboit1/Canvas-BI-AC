@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ClientboundBlockEventPacket;
+import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundLevelEventPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket;
@@ -144,6 +145,19 @@ public final class VisibilityFilters {
                 player.connection.send(packet);
             }
         }
+    }
+
+    /**
+     * Creates the block update that corrects a single player's view of a block, like after an interaction the server
+     * rejected. Hidden blocks are sent disguised, so modified clients can't probe them through walls with interaction
+     * packets.
+     */
+    public static ClientboundBlockUpdatePacket blockUpdateFor(final ServerPlayer player, final Level level, final BlockPos pos) {
+        final BlockState state = level.getBlockState(pos);
+        if (player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)) {
+            return new ClientboundBlockUpdatePacket(pos, hideBlock(level, pos.getY()));
+        }
+        return new ClientboundBlockUpdatePacket(pos, state);
     }
 
     /**

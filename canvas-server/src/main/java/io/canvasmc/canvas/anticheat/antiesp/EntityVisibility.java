@@ -171,6 +171,21 @@ public final class EntityVisibility implements VisibilityModule {
     }
 
     /**
+     * Whether anti-ESP currently hides the entity from the player. Unlike {@link #canSee} this never changes any state,
+     * entities the entity tracker didn't ask about recently (out of tracking range) aren't hidden by anti-ESP.
+     */
+    public boolean isHidden(final Entity entity) {
+        if (!this.passActive) {
+            return false;
+        }
+        final Entity root = entity.getRootVehicle();
+        final EntityTable table = this.table;
+        final int slot = table.find(root.getId());
+        return slot >= 0 && table.entity[slot] == root && !table.always[slot]
+            && table.state[slot] == EntityTable.HIDDEN && this.pass - table.seen[slot] <= 1;
+    }
+
+    /**
      * Entity tracker check, see the class documentation.
      */
     public boolean canSee(final Entity entity) {

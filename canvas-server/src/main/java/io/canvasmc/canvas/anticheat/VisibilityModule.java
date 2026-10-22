@@ -11,7 +11,8 @@ import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
  *     <li>Every method except {@link #runAsync} is called on the region thread owning the player.</li>
  *     <li>{@link #runAsync} is called on an anticheat worker thread, at most once at a time per player. Everything
  *     written by {@link #prepareAsync} is visible to it, and everything it writes is visible to the following
- *     {@link #applyResults} call.</li>
+ *     {@link #applyResults} call. Jobs of different modules run independently of each other, possibly at the same
+ *     time.</li>
  *     <li>{@link #applyResults} is only called for jobs of the current epoch, results of older epochs are dropped
  *     by not calling it (the module is {@link #reset} instead).</li>
  * </ul>
@@ -47,7 +48,22 @@ public interface VisibilityModule {
     }
 
     /**
-     * Called every tick while no job is running for this player.
+     * Called every tick while the module is not active, after {@link #reset} was called on deactivation. For undoing
+     * work that is too expensive to do all at once in {@link #reset}, like resending chunks.
+     */
+    default void tickInactive() {
+    }
+
+    /**
+     * Whether players notice late results of this module, so its jobs are run before those of other modules when the
+     * worker pool is busy.
+     */
+    default boolean isLatencySensitive() {
+        return true;
+    }
+
+    /**
+     * Called every tick while no job of this module is running for this player.
      *
      * @return whether asynchronous work is needed now. If so, inputs for {@link #runAsync} should be copied here
      */

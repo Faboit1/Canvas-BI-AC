@@ -10,8 +10,8 @@ import org.jspecify.annotations.Nullable;
  * An immutable copy of everything about a player's point of view that the asynchronous visibility work needs.
  * Taken on the player's region thread right before a job is submitted.
  * <p>
- * The only mutable part is the lazily computed third person camera positions, which are computed on the worker
- * thread that owns the snapshot.
+ * The only mutable part is the lazily computed third person camera positions. The jobs of all modules share the
+ * snapshot, whichever job needs them first computes them, possibly more than one at the same time.
  */
 public final class CameraSnapshot {
 
@@ -52,7 +52,8 @@ public final class CameraSnapshot {
      */
     public final double cameraDistance;
 
-    private double @Nullable [] cameras;
+    // volatile publishes the contents of the array to the other jobs
+    private volatile double @Nullable [] cameras;
 
     public CameraSnapshot(final ServerLevel level, final long epoch, final int tick,
                           final double eyeX, final double eyeY, final double eyeZ,
@@ -100,6 +101,9 @@ public final class CameraSnapshot {
      * Returns the camera positions a client can render from: the eyes, followed by the third person back camera and
      * the third person front camera, each pulled in front of the first occluding block like the client does.
      * The array holds {@code x, y, z} triples.
+     * <p>
+     * Only blocks that occlude for the client's camera are considered, so this must be called before options like
+     * {@link OcclusionAccess#setLavaObscures} are enabled on the access.
      */
     public double[] cameras(final OcclusionAccess access) {
         double[] ret = this.cameras;
