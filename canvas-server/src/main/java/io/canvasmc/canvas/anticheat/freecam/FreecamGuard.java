@@ -9,6 +9,7 @@ import io.canvasmc.canvas.anticheat.AnticheatExecutor;
 import io.canvasmc.canvas.anticheat.CameraSnapshot;
 import io.canvasmc.canvas.anticheat.PlayerVisibility;
 import io.canvasmc.canvas.anticheat.VisibilityModule;
+import io.canvasmc.canvas.anticheat.antibud.AntiBud;
 import io.canvasmc.canvas.anticheat.antixray.RayTraceAntiXray;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
@@ -1149,21 +1150,24 @@ public final class FreecamGuard implements VisibilityModule {
      * Creates the chunk packet for this player, with every section, or in per-block mode every block, that can't be
      * visible to them masked.
      */
-    public ClientboundLevelChunkWithLightPacket createChunkPacket(final LevelChunk chunk, final boolean modifyBlocks) {
+    /**
+     * @param buds the buds anti-bud disguises in the chunk, see {@link AntiBud#prepareChunk}
+     */
+    public ClientboundLevelChunkWithLightPacket createChunkPacket(final LevelChunk chunk, final boolean modifyBlocks, final AntiBud.@Nullable ChunkDisguise buds) {
         final WorldConfig.Anticheat config = this.owner.config();
         if (!this.isActive(config)) {
-            return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks, 0L);
+            return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks, 0L, null, 0L, buds);
         }
         this.updateMode(config.antiFreecam);
         if (this.perBlock) {
-            return this.createBlockMaskedPacket(chunk, modifyBlocks);
+            return this.createBlockMaskedPacket(chunk, modifyBlocks, buds);
         }
         final long masked = this.computeMask(chunk);
         return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks, masked, null,
-            masked & ~this.nearVisible(chunk, ~masked));
+            masked & ~this.nearVisible(chunk, ~masked), buds);
     }
 
-    private ClientboundLevelChunkWithLightPacket createBlockMaskedPacket(final LevelChunk chunk, final boolean modifyBlocks) {
+    private ClientboundLevelChunkWithLightPacket createBlockMaskedPacket(final LevelChunk chunk, final boolean modifyBlocks, final AntiBud.@Nullable ChunkDisguise buds) {
         final Level level = chunk.getLevel();
         final int chunkX = chunk.getPos().x();
         final int chunkZ = chunk.getPos().z();
@@ -1202,7 +1206,7 @@ public final class FreecamGuard implements VisibilityModule {
         }
         final long all = sections == 64 ? -1L : (1L << sections) - 1L;
         return new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, modifyBlocks, masked, cells,
-            masked & ~this.nearVisible(chunk, all & ~masked));
+            masked & ~this.nearVisible(chunk, all & ~masked), buds);
     }
 
     /**

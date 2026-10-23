@@ -1,5 +1,6 @@
 package io.canvasmc.canvas.anticheat.freecam;
 
+import io.canvasmc.canvas.anticheat.antibud.BudDisguise;
 import io.papermc.paper.antixray.ChunkPacketInfo;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -119,20 +120,41 @@ public final class ChunkMasking {
     }
 
     /**
-     * Copies the blocks of a section, replacing every block that isn't visible by filler. Runs on the thread owning
-     * the chunk.
+     * Copies the blocks of a section, replacing every block that isn't visible by filler, and the buds anti-bud
+     * disguises by small buds. Runs on the thread owning the chunk.
      *
-     * @param visible the visible blocks, indexed by {@code x | z << 4 | y << 8}
+     * @param visible the visible blocks, indexed by {@code x | z << 4 | y << 8}, or {@code null} if all are
+     * @param buds    the blocks to disguise, indexed the same way, or {@code null} if there are none, see
+     *                {@link io.canvasmc.canvas.anticheat.antibud.AntiBud#prepareChunk}
      */
-    public static MaskedBlocks maskBlocks(final LevelChunk chunk, final LevelChunkSection section, final int sectionIndex, final long[] visible) {
+    public static MaskedBlocks maskBlocks(final LevelChunk chunk, final LevelChunkSection section, final int sectionIndex,
+                                          final long @Nullable [] visible, final int @Nullable [] buds) {
         final BlockState filler = Block.stateById(fillerId(chunk.getLevel(), chunk.getMinSectionY() + sectionIndex));
         final PalettedContainer<BlockState> states = section.getStates().copy();
-        // adds the filler to the palette up front, so ids stay valid while the storage is rewritten directly
-        states.data.palette().idFor(filler, states);
+        // adds the replacements to the palette up front, so ids stay valid while the storage is rewritten directly
+        if (visible != null) {
+            states.data.palette().idFor(filler, states);
+        }
+        if (buds != null) {
+            for (final int index : buds) {
+                states.data.palette().idFor(BudDisguise.disguise(states.get(index)), states);
+            }
+        }
         final PalettedContainer.Data<BlockState> data = states.data;
-        final int fillerId = data.palette().idFor(filler, PaletteResize.noResizeExpected());
         int nonEmpty = section.canvas$nonEmptyBlockCount();
         int fluids = section.canvas$fluidCount();
+        if (buds != null) {
+            for (final int index : buds) {
+                if (visible == null || (visible[index >>> 6] >>> index & 1L) != 0L) {
+                    // same fluid, never air
+                    data.storage().set(index, data.palette().idFor(BudDisguise.disguise(data.palette().valueFor(data.storage().get(index))), PaletteResize.noResizeExpected()));
+                }
+            }
+        }
+        if (visible == null) {
+            return new MaskedBlocks(states, section.getBiomes(), (short) nonEmpty, (short) fluids);
+        }
+        final int fillerId = data.palette().idFor(filler, PaletteResize.noResizeExpected());
         for (int word = 0; word < CellVisibility.WORDS; ++word) {
             for (long hidden = ~visible[word]; hidden != 0L; hidden &= hidden - 1L) {
                 final int index = word << 6 | Long.numberOfTrailingZeros(hidden);

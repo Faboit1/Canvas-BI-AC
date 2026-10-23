@@ -592,8 +592,9 @@ public class WorldConfig extends Part {
                 ).blank()
                 .wordWrap(
                     "Bypass permissions: \"canvas.anticheat.bypass.antixray\", \"canvas.anticheat.bypass.antiesp\",",
-                    "\"canvas.anticheat.bypass.antifreecam\" and \"canvas.anticheat.bypass.undergroundviewdistance\",",
-                    "or \"canvas.anticheat.bypass\" for all of them. They are not granted to operators by default.",
+                    "\"canvas.anticheat.bypass.antifreecam\", \"canvas.anticheat.bypass.undergroundviewdistance\" and",
+                    "\"canvas.anticheat.bypass.antibud\", or \"canvas.anticheat.bypass\" for all of them. They are not granted",
+                    "to operators by default.",
                     "Spectators always bypass anti-esp and anti-freecam"
                 )
             );
@@ -847,6 +848,31 @@ public class WorldConfig extends Part {
         }
 
         public boolean obfuscatePlayerHealth = false;
+
+        {
+            option("antiBud")
+                .docs(
+                    Style.wrap(
+                        "Hides how far amethyst buds have grown. Buds only grow in loaded chunks, so fully grown clusters",
+                        "give away where players spend their time, which bud ESP mods use to find bases from far away.",
+                        "Medium and large buds and clusters farther than \"reveal-distance\" from the player are sent as",
+                        "small buds facing the same way, with the block light a small bud would give. Once the player gets",
+                        "closer, the real bud and its light are sent, and the bud stays real for them from then on"
+                    )
+                );
+        }
+
+        public AntiBud antiBud = new AntiBud();
+        public static class AntiBud extends Part {
+
+            {
+                option("enabled").docs("Whether anti-bud is enabled in this world");
+                option("revealDistance").docs("Buds within this many blocks of the player's eyes are sent real").greaterThanOrEqualTo(0.0F);
+            }
+
+            public boolean enabled = false;
+            public double revealDistance = 16.0D;
+        }
     }
 
     public double waypointUpdateScale = 4000.0D;
