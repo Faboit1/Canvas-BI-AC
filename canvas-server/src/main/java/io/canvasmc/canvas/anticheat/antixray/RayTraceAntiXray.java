@@ -731,7 +731,7 @@ public final class RayTraceAntiXray implements VisibilityModule {
 
     private void sendRealState(final LevelChunk chunk, final BlockPos pos) {
         final BlockState state = chunk.getBlockState(pos);
-        this.owner.player.connection.send(new ClientboundBlockUpdatePacket(pos, state));
+        this.owner.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.owner.disguiseBlock(pos.getX(), pos.getY(), pos.getZ(), state)));
         if (state.hasBlockEntity()) {
             final BlockEntity blockEntity = chunk.getBlockEntity(pos);
             final Packet<ClientGamePacketListener> packet = blockEntity == null ? null : blockEntity.getUpdatePacket();

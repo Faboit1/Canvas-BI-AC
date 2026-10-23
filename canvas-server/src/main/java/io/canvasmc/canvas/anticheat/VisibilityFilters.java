@@ -1,5 +1,7 @@
 package io.canvasmc.canvas.anticheat;
 
+import io.canvasmc.canvas.anticheat.antibud.AntiBud;
+import io.canvasmc.canvas.anticheat.antibud.BudDisguise;
 import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
 import java.util.ArrayList;
 import java.util.List;
@@ -63,6 +65,38 @@ public final class VisibilityFilters {
     }
 
     /**
+     * Sends a block update to every player that may see the block, disguised for those anti-bud disguises it from.
+     *
+     * @return the players that received the update, see {@link #receiversOf}
+     */
+    public static List<ServerPlayer> broadcastBlockUpdate(final List<ServerPlayer> players, final BlockPos pos, final BlockState state) {
+        final List<ServerPlayer> receivers = receiversOf(players, pos, state);
+        final boolean bud = BudDisguise.isBud(state);
+        ClientboundBlockUpdatePacket packet = null;
+        ClientboundBlockUpdatePacket disguised = null;
+        for (int i = 0, len = receivers.size(); i < len; ++i) {
+            final ServerPlayer player = receivers.get(i);
+            final BlockState send = bud ? player.canvas$visibility.filterBlockUpdate(pos.getX(), pos.getY(), pos.getZ(), state) : state;
+            if (send == null) {
+                // the client has the disguise already
+                continue;
+            }
+            if (send != state) {
+                if (disguised == null) {
+                    disguised = new ClientboundBlockUpdatePacket(pos, BudDisguise.disguise(state));
+                }
+                player.connection.send(disguised);
+            } else {
+                if (packet == null) {
+                    packet = new ClientboundBlockUpdatePacket(pos, state);
+                }
+                player.connection.send(packet);
+            }
+        }
+        return receivers;
+    }
+
+    /**
      * Sends a multi block update to every player, leaving out the positions each player must not see.
      */
     public static void broadcastSectionUpdate(final List<ServerPlayer> players, final ClientboundSectionBlocksUpdatePacket packet) {
@@ -75,11 +109,16 @@ public final class VisibilityFilters {
     }
 
     /**
-     * Sends a light update to every player, leaving out the sections each player must not see.
+     * Sends a light update to every player, leaving out the sections each player must not see, with the light of the
+     * buds disguised from them corrected.
      */
-    public static void broadcastLightUpdate(final List<ServerPlayer> players, final ClientboundLightUpdatePacket packet) {
+    public static void broadcastLightUpdate(final Level level, final List<ServerPlayer> players, final ClientboundLightUpdatePacket packet) {
+        if (players.isEmpty()) {
+            return;
+        }
+        final AntiBud.LightScan budScan = AntiBud.scan((ServerLevel) level, packet);
         for (final ServerPlayer player : players) {
-            final ClientboundLightUpdatePacket filtered = player.canvas$visibility.filterLightUpdate(packet);
+            final ClientboundLightUpdatePacket filtered = player.canvas$visibility.filterLightUpdate(packet, budScan);
             if (filtered != null) {
                 player.connection.send(filtered);
             }
@@ -163,6 +202,7 @@ public final class VisibilityFilters {
         final BlockState state = Block.stateById(data);
         final ClientboundLevelEventPacket packet = new ClientboundLevelEventPacket(type, pos, data, false);
         ClientboundLevelEventPacket disguised = null;
+        ClientboundLevelEventPacket disguisedBud = null;
         for (final ServerPlayer player : level.getServer().getPlayerList().getPlayers()) {
             if (player == except || player.level() != level) {
                 continue;
@@ -181,6 +221,12 @@ public final class VisibilityFilters {
                     disguised = new ClientboundLevelEventPacket(type, pos, Block.getId(hideBlock(level, pos.getY())), false);
                 }
                 player.connection.send(disguised);
+            } else if (BudDisguise.isDisguised(state) && player.canvas$visibility.disguisesBudAt(pos.getX(), pos.getY(), pos.getZ())) {
+                // the size of a bud shows in its particles and sound
+                if (disguisedBud == null) {
+                    disguisedBud = new ClientboundLevelEventPacket(type, pos, Block.getId(BudDisguise.disguise(state)), false);
+                }
+                player.connection.send(disguisedBud);
             } else {
                 player.connection.send(packet);
             }
@@ -190,14 +236,14 @@ public final class VisibilityFilters {
     /**
      * Creates the block update that corrects a single player's view of a block, like after an interaction the server
      * rejected. Hidden blocks are sent disguised, so modified clients can't probe them through walls with interaction
-     * packets.
+     * packets, and so are buds anti-bud disguises.
      */
     public static ClientboundBlockUpdatePacket blockUpdateFor(final ServerPlayer player, final Level level, final BlockPos pos) {
         final BlockState state = level.getBlockState(pos);
         if (player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)) {
             return new ClientboundBlockUpdatePacket(pos, hideBlock(level, pos.getY()));
         }
-        return new ClientboundBlockUpdatePacket(pos, state);
+        return new ClientboundBlockUpdatePacket(pos, player.canvas$visibility.disguiseBlock(pos.getX(), pos.getY(), pos.getZ(), state));
     }
 
     /**
