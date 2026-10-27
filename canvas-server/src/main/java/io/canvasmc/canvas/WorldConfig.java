@@ -581,6 +581,300 @@ public class WorldConfig extends Part {
             );
     }
 
+    {
+        option("anticheat")
+            .docs(
+                Style.wrap(
+                    "Native, server-side visibility protections. Everything here is computed from the player's",
+                    "real position on the server, so client side mods (x-ray, ESP, freecam) only ever receive",
+                    "what the player could legitimately see. All checks run asynchronously on the anticheat",
+                    "worker threads (see \"anticheat\" in canvas-server.yml) and never block region threads."
+                ).blank()
+                .wordWrap(
+                    "Bypass permissions: \"canvas.anticheat.bypass.antixray\", \"canvas.anticheat.bypass.antiesp\",",
+                    "\"canvas.anticheat.bypass.antifreecam\", \"canvas.anticheat.bypass.undergroundviewdistance\" and",
+                    "\"canvas.anticheat.bypass.antibud\", or \"canvas.anticheat.bypass\" for all of them. They are not granted",
+                    "to operators by default.",
+                    "Spectators always bypass anti-esp and anti-freecam"
+                )
+            );
+    }
+
+    public Anticheat anticheat = new Anticheat();
+    public static class Anticheat extends Part {
+
+        {
+            option("rayTraceAntiXray")
+                .docs(
+                    Style.wrap(
+                        "Ray traced anti-xray, a native port of RayTraceAntiXray by stonar96. Requires Paper anti-xray",
+                        "to be enabled with \"engine-mode: 1\" in the paper world configuration. Ores (and other configured",
+                        "blocks) that are exposed to air are hidden when the chunk is sent and are only revealed once",
+                        "the server can trace a line of sight to them from the player's eyes. Block entities of hidden",
+                        "blocks (chests, spawners, ...) are stripped from the chunk packet too"
+                    )
+                );
+        }
+
+        public RayTraceAntiXray rayTraceAntiXray = new RayTraceAntiXray();
+        public static class RayTraceAntiXray extends Part {
+
+            {
+                option("enabled").docs("Whether ray traced anti-xray is enabled in this world");
+                option("rayTraceThirdPerson").docs("Also trace from the third person front and back camera positions. More expensive, but avoids late reveals for players in F5");
+                option("rayTraceDistance")
+                    .docs(
+                        "Blocks further than this many blocks from the player's eyes are not traced and keep their",
+                        "current (hidden or revealed) state"
+                    ).greaterThan(0.0F);
+                option("rehideBlocks").docs("Whether revealed blocks that are no longer visible are hidden again. If false, a block stays revealed until its chunk is resent");
+                option("rehideDistance").docs("Revealed blocks at or beyond this distance are treated as invisible and are hidden again (only when \"rehide-blocks\" is enabled)").greaterThanOrEqualTo(0.0F);
+                option("maxRayTraceBlockCountPerChunk").docs("Maximum number of exposed blocks hidden and traced per chunk. Counting starts at the bottom of the world").greaterThanOrEqualTo(0.0F);
+                option("rayTraceBlocks")
+                    .docs(
+                        "Blocks that are hidden while exposed to air and ray traced, for example \"minecraft:diamond_ore\".",
+                        "If empty, the \"hidden-blocks\" list from the paper anti-xray configuration is used"
+                    );
+                option("frustumCulling")
+                    .docs(
+                        "Only reveal blocks in front of the player. Prevents revealing ores behind the player's back, which",
+                        "is what freecam style cheats rely on, at the cost of a short delay when turning around quickly"
+                    );
+                option("updateIntervalTicks").docs("How often, in ticks, the visibility of hidden blocks is recomputed for a player that isn't moving. Moving players are updated every tick").greaterThan(0.0F);
+            }
+
+            public boolean enabled = false;
+            public boolean rayTraceThirdPerson = false;
+            public double rayTraceDistance = 80.0D;
+            public boolean rehideBlocks = false;
+            public double rehideDistance = Double.POSITIVE_INFINITY;
+            public int maxRayTraceBlockCountPerChunk = 100;
+            public List<String> rayTraceBlocks = new ArrayList<>();
+            public boolean frustumCulling = true;
+            public int updateIntervalTicks = 10;
+        }
+
+        {
+            option("antiEsp")
+                .docs(
+                    Style.wrap(
+                        "Ray traced anti-ESP. Entities that the server can't trace a line of sight to are not sent to the",
+                        "player at all, so wallhack/ESP/radar mods have nothing to show. Visibility is hooked directly into",
+                        "the entity tracker, which means hidden entities are removed and re-added through the exact same",
+                        "code path as entities entering and leaving tracking range"
+                    )
+                );
+        }
+
+        public AntiEsp antiEsp = new AntiEsp();
+        public static class AntiEsp extends Part {
+
+            {
+                option("enabled").docs("Whether anti-ESP is enabled in this world");
+                option("alwaysVisibleDistance").docs("Entities whose hitbox is within this many blocks of the player's eyes are always visible").greaterThanOrEqualTo(0.0F);
+                option("maxTraceDistance")
+                    .docs(
+                        "Entities further than this many blocks away are always visible. Use this to bound the cost on servers",
+                        "with large entity tracking ranges"
+                    ).greaterThan(0.0F);
+                option("rayTraceThirdPerson").docs("Also trace from the third person front and back camera positions, so players using F5 don't see entities pop in");
+                option("hidePlayers")
+                    .docs(
+                        "Whether players are hidden behind walls. Note: vanilla clients render the name tag of non-sneaking",
+                        "players through walls, so hiding players also hides those name tags. See \"respect-vanilla-name-tags\""
+                    );
+                option("respectVanillaNameTags")
+                    .docs(
+                        "If true, entities whose name tag would be rendered through walls by a vanilla client are never",
+                        "hidden: players that aren't sneaking, aren't invisible to the viewer, are within 64 blocks and are",
+                        "allowed by scoreboard team rules, and entities with an always visible custom name (holograms). This",
+                        "keeps vanilla behavior exactly, but means those entities aren't protected from ESP"
+                    );
+                option("hideProjectiles")
+                    .docs(
+                        "Whether projectiles (arrows, tridents, fireballs, ...) are hidden. They are fast, so hiding them can",
+                        "delay them visually. A player's own projectiles and fishing bobber are always visible to them"
+                    );
+                option("visibleRecheckIntervalTicks")
+                    .docs(
+                        "How often, in ticks, entities that are currently visible are re-checked. Hidden entities are",
+                        "re-checked every tick while they or the player move, and every other tick otherwise"
+                    ).greaterThan(0.0F);
+                option("hideGraceTicks")
+                    .docs(
+                        "How many ticks an entity stays visible after the line of sight to it was lost. Prevents flickering",
+                        "at corners and makes peeking behave smoothly"
+                    ).greaterThanOrEqualTo(0.0F);
+                option("limitLocatorBar")
+                    .docs(
+                        "Whether the locator bar only gets the exact position of players (and other waypoint transmitting",
+                        "entities) the player can currently see, and only their direction otherwise. Without this the locator",
+                        "bar works as a radar for hidden players and everyone within view distance"
+                    );
+                option("excludedEntityTypes")
+                    .docs(
+                        "Entity types that are never hidden, for example \"minecraft:armor_stand\". Bosses, lightning, end",
+                        "crystals, area effect clouds, leash knots, and display and interaction entities that aren't riding",
+                        "another entity are never hidden anyway"
+                    );
+            }
+
+            public boolean enabled = false;
+            public double alwaysVisibleDistance = 4.0D;
+            public double maxTraceDistance = 128.0D;
+            public boolean rayTraceThirdPerson = true;
+            public boolean hidePlayers = true;
+            public boolean respectVanillaNameTags = false;
+            public boolean hideProjectiles = false;
+            public int visibleRecheckIntervalTicks = 4;
+            public int hideGraceTicks = 10;
+            public boolean limitLocatorBar = true;
+            public List<String> excludedEntityTypes = new ArrayList<>();
+
+            private final java.util.concurrent.atomic.AtomicReference<java.util.@Nullable Set<EntityType<?>>> excludedEntityTypesCache = new java.util.concurrent.atomic.AtomicReference<>();
+
+            /**
+             * The entity types of {@link #excludedEntityTypes}, parsed once per loaded configuration. Unknown ids are
+             * logged and ignored.
+             */
+            public java.util.Set<EntityType<?>> compiledExcludedEntityTypes() {
+                final java.util.Set<EntityType<?>> compiled = this.excludedEntityTypesCache.get();
+                if (compiled != null) {
+                    return compiled;
+                }
+                final java.util.Set<EntityType<?>> ret = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>();
+                for (final String name : this.excludedEntityTypes) {
+                    final Identifier id = Identifier.tryParse(name);
+                    final EntityType<?> type = id == null ? null : BuiltInRegistries.ENTITY_TYPE.getOptional(id).orElse(null);
+                    if (type == null) {
+                        LOGGER.warn("Ignoring unknown entity type \"{}\" in the anti-ESP excluded entity types", name);
+                    } else {
+                        ret.add(type);
+                    }
+                }
+                final java.util.Set<EntityType<?>> witness = this.excludedEntityTypesCache.compareAndExchange(null, ret);
+                return witness == null ? ret : witness;
+            }
+        }
+
+        {
+            option("antiFreecam")
+                .docs(
+                    Style.wrap(
+                        "Anti-freecam. The server runs the same section occlusion graph the vanilla client uses for",
+                        "culling, from the player's real position, and only sends the real contents of chunk sections the",
+                        "player could possibly see. All other sections are sent as solid stone (and without light, block",
+                        "entities or block updates), so moving the camera away from the body through walls reveals nothing.",
+                        "Because the server's graph is always a superset of what the client renders, legit players never see",
+                        "the hidden sections. Sections at or above the surface of a chunk are always sent, they are open to",
+                        "the sky anyway, so only what lies underground is protected"
+                    )
+                );
+        }
+
+        public AntiFreecam antiFreecam = new AntiFreecam();
+        public static class AntiFreecam extends Part {
+
+            {
+                option("enabled").docs("Whether anti-freecam is enabled in this world");
+                option("revealMargin")
+                    .docs(
+                        "Sections within this many blocks of the player's eyes are always sent, in addition to everything",
+                        "reachable through the occlusion graph from there. Larger values hide latency for fast moving players"
+                    ).between(2.0F, 32.0F);
+                option("maxResendsPerTick").docs("Maximum amount of chunks re-sent to a single player per tick to reveal newly visible sections").greaterThan(0.0F);
+                option("updateIntervalTicks")
+                    .docs(
+                        "How often, in ticks, the occlusion graph of a player that doesn't move is checked for block changes",
+                        "that open up new lines of sight. Moving players, newly sent chunks and blocks changing between opaque",
+                        "and transparent are handled immediately, this is only a fallback"
+                    ).greaterThan(0.0F);
+                option("perBlock")
+                    .docs(
+                        Style.wrap(
+                            "Masks single blocks instead of whole 16x16x16 sections: every block that no line of sight from the",
+                            "player's possible camera positions can reach is sent as stone, caves, rooms and ores right next to",
+                            "the player included, unless they are open to the sky. Updates of blocks that can't be seen right now",
+                            "are withheld until they can. Costs more worker CPU (a few milliseconds per update at view distance",
+                            "10) and re-sends chunks more often when players dig into or walk through caves"
+                        )
+                    );
+            }
+
+            public boolean enabled = false;
+            public double revealMargin = 8.0D;
+            public int maxResendsPerTick = 8;
+            public int updateIntervalTicks = 10;
+            public boolean perBlock = false;
+        }
+
+        {
+            option("undergroundViewDistance")
+                .docs(
+                    Style.wrap(
+                        "Lowers the chunk view distance (the chunks sent to the client) of players that are underground,",
+                        "where they can't see far anyway. Server side loading and ticking distances are not changed.",
+                        "A player counts as underground when their eyes are at least \"surface-depth\" blocks below the",
+                        "surface of the column they are in and receive no sky light"
+                    )
+                );
+        }
+
+        public UndergroundViewDistance undergroundViewDistance = new UndergroundViewDistance();
+        public static class UndergroundViewDistance extends Part {
+
+            {
+                option("enabled").docs("Whether the underground view distance is enabled in this world");
+                option("viewDistance").docs("The view distance, in chunks, used while a player is underground").between(2.0F, 32.0F);
+                option("surfaceDepth").docs("How many blocks below the surface a player's eyes need to be to count as underground").greaterThanOrEqualTo(0.0F);
+                option("enterDelayTicks").docs("How many ticks a player needs to stay underground before the view distance is lowered").greaterThanOrEqualTo(0.0F);
+                option("exitDelayTicks").docs("How many ticks a player needs to stay above ground before the view distance is restored").greaterThanOrEqualTo(0.0F);
+            }
+
+            public boolean enabled = false;
+            public int viewDistance = 4;
+            public int surfaceDepth = 10;
+            public int enterDelayTicks = 40;
+            public int exitDelayTicks = 5;
+        }
+
+        {
+            option("obfuscatePlayerHealth")
+                .docs(
+                    "Sends a fake health (the player's max health, or 0 once dead) and no absorption for other players,",
+                    "so health indicator mods can't read them. Vanilla clients never display the health of other players,",
+                    "the death animation keeps working. Scoreboard based health displays are not affected"
+                );
+        }
+
+        public boolean obfuscatePlayerHealth = false;
+
+        {
+            option("antiBud")
+                .docs(
+                    Style.wrap(
+                        "Hides how far amethyst buds have grown. Buds only grow in loaded chunks, so fully grown clusters",
+                        "give away where players spend their time, which bud ESP mods use to find bases from far away.",
+                        "Medium and large buds and clusters farther than \"reveal-distance\" from the player are sent as",
+                        "small buds facing the same way, with the block light a small bud would give. Once the player gets",
+                        "closer, the real bud and its light are sent, and the bud stays real for them from then on"
+                    )
+                );
+        }
+
+        public AntiBud antiBud = new AntiBud();
+        public static class AntiBud extends Part {
+
+            {
+                option("enabled").docs("Whether anti-bud is enabled in this world");
+                option("revealDistance").docs("Buds within this many blocks of the player's eyes are sent real").greaterThanOrEqualTo(0.0F);
+            }
+
+            public boolean enabled = false;
+            public double revealDistance = 16.0D;
+        }
+    }
+
     public double waypointUpdateScale = 4000.0D;
     public boolean disableCriterionTrigger = false;
     public boolean cactusCheckSurvivalBeforeGrowth = false;
