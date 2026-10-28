@@ -601,12 +601,12 @@ public class WorldConfig extends Part {
             option("preset")
                 .docs(
                     Style.wrap(
-                        "Sets every anticheat option below at once, from the cheapest setting that still protects to",
+                        "Sets every other anticheat option at once, from the cheapest setting that still protects to",
                         "the strongest one, except the block and entity lists, which keep their configured values. With",
-                        "\"custom\" the options below are used as they are configured. Ray traced anti-xray (high and up)",
+                        "\"custom\" the other options are used as they are configured. Ray traced anti-xray (high and up)",
                         "needs Paper anti-xray with \"engine-mode: 1\" in the paper world configuration"
                     ).defineEnum(Preset.class, (preset) -> switch (preset) {
-                        case CUSTOM -> "The options below, as configured";
+                        case CUSTOM -> "The other options, as configured";
                         case LOW -> "Storage hiding (32 blocks), anti-bud, health obfuscation and the underground view distance";
                         case MEDIUM -> "Low, plus section anti-freecam and anti-ESP, storage traced to 48 blocks";
                         case HIGH -> "Per-block anti-freecam, ray traced anti-xray, third person cameras, storage to 64 blocks";
