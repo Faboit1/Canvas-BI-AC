@@ -6,10 +6,10 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * The settings behind {@link WorldConfig.Anticheat#preset}, from the cheapest that still protects to the strongest.
  * <p>
- * The levels add protection in this order: storage hiding, anti-bud, health obfuscation and the underground view
- * distance first, since they are cheap and protect bases; then anti-ESP and section anti-freecam; then per-block
- * anti-freecam and ray traced anti-xray. The top levels trace farther, more often and with higher limits. Every level
- * hides storage, so no level gives away bases.
+ * The levels add protection in this order: storage hiding, invisible players, anti-bud, health obfuscation and the
+ * underground view distance first, since they are cheap and protect bases; then anti-ESP and section anti-freecam;
+ * then per-block anti-freecam and ray traced anti-xray. The top levels trace farther, more often and with higher
+ * limits. Every level hides storage, so no level gives away bases.
  */
 public final class AnticheatPresets {
 
@@ -37,8 +37,9 @@ public final class AnticheatPresets {
     private static WorldConfig.Anticheat create(final WorldConfig.Anticheat configured) {
         final WorldConfig.Anticheat ret = new WorldConfig.Anticheat();
         ret.preset = configured.preset;
-        // the lists say what to protect, not how hard
+        // the lists say what to protect, not how hard, and the filler is a matter of taste
         ret.rayTraceAntiXray.rayTraceBlocks = configured.rayTraceAntiXray.rayTraceBlocks;
+        ret.antiFreecam.filler = configured.antiFreecam.filler;
         ret.antiEsp.excludedEntityTypes = configured.antiEsp.excludedEntityTypes;
         ret.antiEsp.respectVanillaNameTags = configured.antiEsp.respectVanillaNameTags;
         ret.antiStorageEsp.blocks = configured.antiStorageEsp.blocks;
@@ -54,6 +55,10 @@ public final class AnticheatPresets {
         storage.maxTracedBlocksPerTick = level.pick(128, 512, 2048, 4096, 8192, Integer.MAX_VALUE);
         storage.updateIntervalTicks = level.pick(20, 10, 10, 5, 2, 1);
 
+        final WorldConfig.Anticheat.InvisiblePlayers invisible = ret.invisiblePlayers;
+        invisible.enabled = true;
+        invisible.anonymize = true;
+
         final WorldConfig.Anticheat.AntiBud bud = ret.antiBud;
         bud.enabled = true;
         bud.revealDistance = level.pick(16, 16, 16, 16, 12, 10);
@@ -68,6 +73,7 @@ public final class AnticheatPresets {
         freecam.revealMargin = 8.0;
         freecam.updateIntervalTicks = level.pick(20, 20, 10, 5, 2, 1);
         freecam.maxResendsPerTick = level.pick(4, 4, 8, 12, 16, 32);
+        freecam.hideParticles = true;
 
         final WorldConfig.Anticheat.AntiEsp esp = ret.antiEsp;
         esp.enabled = level.atLeast(Level.MEDIUM);

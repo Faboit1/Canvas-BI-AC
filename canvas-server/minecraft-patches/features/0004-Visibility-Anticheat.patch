@@ -616,11 +616,22 @@ index dd420759b64ef9f18008e86816e37ebf94086b76..7dbd6d8abcef90ccff9a7383d2fbb7ef
                      if (this.seenBy.add(player.connection)) {
                          // Paper start - entity tracking events
 diff --git a/net/minecraft/server/level/ServerEntity.java b/net/minecraft/server/level/ServerEntity.java
-index a126a42a2daaccb0c7dd65c4ad7ec6dce968ea24..f99d4970141757f9315b8968fd32316bda0216f7 100644
+index a126a42a2daaccb0c7dd65c4ad7ec6dce968ea24..cda2dc6eca209b238244e115a7c62fabda2b3e76 100644
 --- a/net/minecraft/server/level/ServerEntity.java
 +++ b/net/minecraft/server/level/ServerEntity.java
-@@ -388,7 +388,7 @@ public class ServerEntity {
+@@ -367,6 +367,7 @@ public class ServerEntity {
+     public void removePairing(final ServerPlayer player) {
+         this.entity.stopSeenByPlayer(player);
+         player.connection.send(new ClientboundRemoveEntitiesPacket(this.entity.getId()));
++        player.canvas$visibility.onUnpaired(this.entity); // Canvas - visibility anticheat - invisible players
+     }
+ 
+     public void addPairing(final ServerPlayer player) {
+@@ -386,9 +387,10 @@ public class ServerEntity {
+         }
+ 
          Packet<ClientGamePacketListener> packet = this.entity.getAddEntityPacket(this);
++        packet = player.canvas$visibility.pairingPacket(this.entity, packet, broadcast); // Canvas - visibility anticheat - invisible players
          broadcast.accept(packet);
          if (this.trackedDataValues != null) {
 -            broadcast.accept(new ClientboundSetEntityDataPacket(this.entity.getId(), this.trackedDataValues));
@@ -628,7 +639,7 @@ index a126a42a2daaccb0c7dd65c4ad7ec6dce968ea24..f99d4970141757f9315b8968fd32316b
          }
  
          if (this.entity instanceof LivingEntity livingEntity) {
-@@ -457,6 +457,14 @@ public class ServerEntity {
+@@ -457,6 +459,14 @@ public class ServerEntity {
          List<SynchedEntityData.DataValue<?>> packedValues = entityData.packDirty();
          if (packedValues != null) {
              this.trackedDataValues = entityData.getNonDefaultValues();
@@ -644,7 +655,7 @@ index a126a42a2daaccb0c7dd65c4ad7ec6dce968ea24..f99d4970141757f9315b8968fd32316b
          }
  
 diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-index e9dfc516cbbc991412d4b6463572099ad3865954..1bcaeb1f908269344547e6622f7e04dcf8ab5ff9 100644
+index e9dfc516cbbc991412d4b6463572099ad3865954..a31b943cd43031cb4fa891ec9428faca1588b24d 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
 @@ -1892,6 +1892,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
@@ -659,20 +670,28 @@ index e9dfc516cbbc991412d4b6463572099ad3865954..1bcaeb1f908269344547e6622f7e04dc
                      player.connection.send(new ClientboundBlockDestructionPacket(id, blockPos, progress));
                  }
              }
-@@ -1972,6 +1977,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -1972,17 +1977,9 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
  
      @Override
      public void levelEvent(final @Nullable Entity source, final int type, final BlockPos pos, final int data) {
-+        // Canvas start - visibility anticheat - disguise the broken state of hidden blocks
-+        if (type == net.minecraft.world.level.block.LevelEvent.PARTICLES_DESTROY_BLOCK) {
-+            io.canvasmc.canvas.anticheat.VisibilityFilters.broadcastBlockBreakEvent(this, source instanceof Player player ? player : null, type, pos, data);
-+            return;
-+        }
+-        this.server
+-            .getPlayerList()
+-            .broadcast(
+-                source instanceof Player player ? player : null,
+-                pos.getX(),
+-                pos.getY(),
+-                pos.getZ(),
+-                64.0, // Paper - diff on change (the 64.0 distance is used as defaults for sound ranges in spigot config for ender dragon, end portal and wither)
+-                this.dimension(),
+-                new ClientboundLevelEventPacket(type, pos, data, false)
+-            );
++        // Canvas start - visibility anticheat - no particles in places players can't see, disguise the broken state of hidden blocks
++        io.canvasmc.canvas.anticheat.VisibilityFilters.broadcastLevelEvent(this, source instanceof Player player ? player : null, type, pos, data);
 +        // Canvas end - visibility anticheat
-         this.server
-             .getPlayerList()
-             .broadcast(
-@@ -2008,6 +2019,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     }
+ 
+     public int getLogicalHeight() {
+@@ -2008,6 +2005,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          }
  
          this.getChunkSource().blockChanged(pos);
@@ -684,7 +703,22 @@ index e9dfc516cbbc991412d4b6463572099ad3865954..1bcaeb1f908269344547e6622f7e04dc
          regionizedWorldData.pathTypesByPosCache.invalidate(pos); // Folia - region threading
          if (this.paperConfig().misc.updatePathfindingOnBlockUpdate) { // Paper - option to disable pathfinding updates
          VoxelShape oldShape = old.getCollisionShape(this, pos);
-@@ -2203,17 +2219,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -2177,7 +2179,13 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         for (ServerPlayer player : this.getLocalPlayers()) { // Folia - region thraeding
+             if (player.distanceToSqr(center) < 4096.0) {
+                 Optional<Vec3> playerKnockback = Optional.ofNullable(explosion.getHitPlayers().get(player));
+-                player.connection.send(new ClientboundExplodePacket(center, r, blockCount, playerKnockback, explosionParticle, explosionSound, blockParticles));
++                // Canvas start - visibility anticheat - only the sound of explosions in places the player can't see
++                final net.minecraft.network.protocol.Packet<?> explosionPacket = io.canvasmc.canvas.anticheat.VisibilityFilters.explosionFor(player,
++                    new ClientboundExplodePacket(center, r, blockCount, playerKnockback, explosionParticle, explosionSound, blockParticles));
++                if (explosionPacket != null) {
++                    player.connection.send(explosionPacket);
++                }
++                // Canvas end - visibility anticheat
+             }
+         }
+ 
+@@ -2203,17 +2211,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          // Folia end - region threading
              if (this.shouldTickBlocksAt(eventData.pos())) {
                  if (this.doBlockEvent(eventData)) {
@@ -707,6 +741,15 @@ index e9dfc516cbbc991412d4b6463572099ad3865954..1bcaeb1f908269344547e6622f7e04dc
                  }
              } else {
                  blockEventsToReschedule.add(eventData); // Folia - region threading
+@@ -2354,6 +2356,8 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     ) {
+         if (player.level() != this) {
+             return false;
++        } else if (player.canvas$visibility.hidesParticlesAt(Mth.floor(x), Mth.floor(y), Mth.floor(z))) { // Canvas - visibility anticheat - no particles in places the player can't see
++            return false;
+         } else {
+             BlockPos pos = player.blockPosition();
+             if (pos.closerToCenterThan(new Vec3(x, y, z), overrideLimiter ? 512.0 : 32.0)) {
 diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
 index c562ad30bca503f9050b8067046ed37936aec50d..8ccfff9c85dd7862cdb962bd4fb41ae731ae86e5 100644
 --- a/net/minecraft/server/level/ServerPlayer.java
@@ -786,7 +829,7 @@ index 196c01fe5f200ed57e6f23e0939cac616305571a..a0f573b298724ccba1fc806df50ee570
          // Paper start - PlayerChunkLoadEvent
          if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index c93d531dae987137c77357d16af07085c3057665..04c643fe843007673ee2542fb5953175ea77a76a 100644
+index c93d531dae987137c77357d16af07085c3057665..984fad6fcdd6cb186d8fc200b0723ec39adce236 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 @@ -1124,7 +1124,13 @@ public class ServerGamePacketListenerImpl
@@ -812,7 +855,29 @@ index c93d531dae987137c77357d16af07085c3057665..04c643fe843007673ee2542fb5953175
          this.send(ClientboundPlayerPositionPacket.of(this.awaitingTeleport, destination, relatives));
      }
  
-@@ -2298,8 +2305,10 @@ public class ServerGamePacketListenerImpl
+@@ -2156,6 +2163,13 @@ public class ServerGamePacketListenerImpl
+                         return;
+                     }
+                     // Paper end - Don't allow digging into unloaded chunks
++                    // Canvas start - visibility anticheat - a client that had the invisible player in front of the block would have hit them
++                    if (action == ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK && this.player.canvas$visibility.interceptsDestroy()) {
++                        this.player.connection.ackBlockChangesUpTo(packet.getSequence());
++                        this.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, this.player.level(), pos));
++                        return;
++                    }
++                    // Canvas end - visibility anticheat
+                     // Paper start - Send block entities after destroy prediction
+                     this.player.gameMode.capturedBlockEntity = false;
+                     this.player.gameMode.captureSentBlockEntities = true;
+@@ -2224,6 +2238,7 @@ public class ServerGamePacketListenerImpl
+     @Override
+     public void handleUseItemOn(final ServerboundUseItemOnPacket packet) {
+         PacketUtils.ensureRunningOnSameThread(packet, this, this.player.level());
++        this.player.canvas$visibility.onInteraction(); // Canvas - visibility anticheat - the client swings after it
+         if (this.player.isImmobile()) return; // CraftBukkit
+         if (!this.checkLimit(packet.timestamp)) return; // Spigot - check limit
+         if (this.hasClientLoaded()) {
+@@ -2298,8 +2313,10 @@ public class ServerGamePacketListenerImpl
                                  // this.player.sendBuildLimitMessage(true, maxY); // Paper - Fix MC-306582: Fix build limit message being sent when it shouldn't be
                              }
  
@@ -825,6 +890,30 @@ index c93d531dae987137c77357d16af07085c3057665..04c643fe843007673ee2542fb5953175
                          }
                          if (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.updateEquipmentOnPlayerActions) this.player.detectEquipmentUpdates(); // Paper - Force update attributes.
                          // Paper - Remove unused warning
+@@ -2312,6 +2329,7 @@ public class ServerGamePacketListenerImpl
+     @Override
+     public void handleUseItem(final ServerboundUseItemPacket packet) {
+         PacketUtils.ensureRunningOnSameThread(packet, this, this.player.level());
++        this.player.canvas$visibility.onInteraction(); // Canvas - visibility anticheat - the client swings after it
+         if (this.player.isImmobile()) return; // CraftBukkit
+         if (!this.checkLimit(packet.timestamp)) return; // Spigot - check limit
+         if (this.hasClientLoaded()) {
+@@ -2809,6 +2827,7 @@ public class ServerGamePacketListenerImpl
+         PacketUtils.ensureRunningOnSameThread(packet, this, this.player.level());
+         if (this.player.isImmobile()) return; // CraftBukkit
+         this.player.resetLastActionTime();
++        if (packet.getHand() == InteractionHand.MAIN_HAND) this.player.canvas$visibility.onSwing(); // Canvas - visibility anticheat - hits on invisible players the client doesn't have
+         // CraftBukkit start - Raytrace to look for 'rogue armswings'
+         Location origin = CraftLocation.toBukkit(this.player.getEyePosition(), this.player.level(), this.player.getYRot(), this.player.getXRot());
+         double maxRange = Math.max(this.player.blockInteractionRange(), this.player.entityInteractionRange()); // todo flawed
+@@ -3032,6 +3051,7 @@ public class ServerGamePacketListenerImpl
+     @Override
+     public void handleInteract(final ServerboundInteractPacket packet) {
+         PacketUtils.ensureRunningOnSameThread(packet, this, this.player.level());
++        this.player.canvas$visibility.onInteraction(); // Canvas - visibility anticheat - the client swings after it
+         if (this.player.isImmobile()) return; // CraftBukkit
+         if (this.hasClientLoaded()) {
+             ServerLevel level = this.player.level();
 diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
 index 1bded76bb6efba6c31a273fdc6cafbcfb132bc38..44d0976970df0c3eb71133649db8c9ea9fb2d302 100644
 --- a/net/minecraft/world/entity/Entity.java
