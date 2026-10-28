@@ -1,6 +1,5 @@
 package io.canvasmc.canvas.anticheat.freecam;
 
-import io.canvasmc.canvas.anticheat.antibud.BudDisguise;
 import io.papermc.paper.antixray.ChunkPacketInfo;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -120,34 +119,43 @@ public final class ChunkMasking {
     }
 
     /**
-     * Copies the blocks of a section, replacing every block that isn't visible by filler, and the buds anti-bud
-     * disguises by small buds. Runs on the thread owning the chunk.
+     * Copies the blocks of a section, replacing every block that isn't visible by filler, and the disguised blocks by
+     * what they are sent as. Runs on the thread owning the chunk.
      *
-     * @param visible the visible blocks, indexed by {@code x | z << 4 | y << 8}, or {@code null} if all are
-     * @param buds    the blocks to disguise, indexed the same way, or {@code null} if there are none, see
-     *                {@link io.canvasmc.canvas.anticheat.antibud.AntiBud#prepareChunk}
+     * @param visible   the visible blocks, indexed by {@code x | z << 4 | y << 8}, or {@code null} if all are
+     * @param disguised the blocks sent as something else, indexed the same way, or {@code null} if there are none,
+     *                  see {@link io.canvasmc.canvas.anticheat.disguise.ChunkRewrite}
+     * @param sentAs    what the disguised blocks are sent as, in the same order
      */
     public static MaskedBlocks maskBlocks(final LevelChunk chunk, final LevelChunkSection section, final int sectionIndex,
-                                          final long @Nullable [] visible, final int @Nullable [] buds) {
+                                          final long @Nullable [] visible, final int @Nullable [] disguised, final BlockState @Nullable [] sentAs) {
         final BlockState filler = Block.stateById(fillerId(chunk.getLevel(), chunk.getMinSectionY() + sectionIndex));
         final PalettedContainer<BlockState> states = section.getStates().copy();
         // adds the replacements to the palette up front, so ids stay valid while the storage is rewritten directly
         if (visible != null) {
             states.data.palette().idFor(filler, states);
         }
-        if (buds != null) {
-            for (final int index : buds) {
-                states.data.palette().idFor(BudDisguise.disguise(states.get(index)), states);
+        if (disguised != null && sentAs != null) {
+            for (final BlockState state : sentAs) {
+                states.data.palette().idFor(state, states);
             }
         }
         final PalettedContainer.Data<BlockState> data = states.data;
         int nonEmpty = section.canvas$nonEmptyBlockCount();
         int fluids = section.canvas$fluidCount();
-        if (buds != null) {
-            for (final int index : buds) {
+        if (disguised != null && sentAs != null) {
+            for (int i = 0; i < disguised.length; ++i) {
+                final int index = disguised[i];
                 if (visible == null || (visible[index >>> 6] >>> index & 1L) != 0L) {
-                    // same fluid, never air
-                    data.storage().set(index, data.palette().idFor(BudDisguise.disguise(data.palette().valueFor(data.storage().get(index))), PaletteResize.noResizeExpected()));
+                    final BlockState old = data.palette().valueFor(data.storage().get(index));
+                    final BlockState sent = sentAs[i];
+                    data.storage().set(index, data.palette().idFor(sent, PaletteResize.noResizeExpected()));
+                    if (old.isAir() != sent.isAir()) {
+                        nonEmpty += sent.isAir() ? -1 : 1;
+                    }
+                    if (old.getFluidState().isEmpty() != sent.getFluidState().isEmpty()) {
+                        fluids += sent.getFluidState().isEmpty() ? -1 : 1;
+                    }
                 }
             }
         }
