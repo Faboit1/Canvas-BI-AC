@@ -2,15 +2,20 @@ package io.canvasmc.canvas.anticheat;
 
 import io.canvasmc.canvas.WorldConfig;
 import io.canvasmc.canvas.anticheat.antibud.AntiBud;
-import io.canvasmc.canvas.anticheat.disguise.BlockDisguises;
-import io.canvasmc.canvas.anticheat.storage.StorageGuard;
 import io.canvasmc.canvas.anticheat.antiesp.EntityVisibility;
 import io.canvasmc.canvas.anticheat.antixray.RayTraceAntiXray;
+import io.canvasmc.canvas.anticheat.disguise.BlockDisguises;
+import io.canvasmc.canvas.anticheat.freecam.ChunkMasking;
 import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
+import io.canvasmc.canvas.anticheat.invisibility.InvisiblePlayers;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionCache;
+import io.canvasmc.canvas.anticheat.storage.StorageGuard;
+import java.util.function.Consumer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.server.level.ServerLevel;
@@ -43,6 +48,7 @@ public final class PlayerVisibility {
     public static final String BYPASS_UNDERGROUND_VIEW_DISTANCE = "canvas.anticheat.bypass.undergroundviewdistance";
     public static final String BYPASS_ANTI_BUD = "canvas.anticheat.bypass.antibud";
     public static final String BYPASS_ANTI_STORAGE_ESP = "canvas.anticheat.bypass.antistorageesp";
+    public static final String BYPASS_INVISIBLE_PLAYERS = "canvas.anticheat.bypass.invisibleplayers";
 
     private static final int PERMISSION_REFRESH_INTERVAL = 100;
 
@@ -55,6 +61,7 @@ public final class PlayerVisibility {
     public final AntiBud antiBud;
     public final StorageGuard storage;
     public final BlockDisguises disguises;
+    public final InvisiblePlayers invisiblePlayers;
 
     private final VisibilityModule[] modules;
     private final boolean[] moduleActive;
@@ -76,6 +83,7 @@ public final class PlayerVisibility {
     private boolean bypassUndergroundViewDistance;
     private boolean bypassAntiBud;
     private boolean bypassAntiStorageEsp;
+    private boolean bypassInvisiblePlayers;
 
     public PlayerVisibility(final ServerPlayer player) {
         this.player = player;
@@ -86,6 +94,7 @@ public final class PlayerVisibility {
         this.antiBud = new AntiBud(this);
         this.storage = new StorageGuard(this);
         this.disguises = new BlockDisguises(this, this.antiBud, this.storage);
+        this.invisiblePlayers = new InvisiblePlayers(this);
         this.modules = new VisibilityModule[] {this.antiXray, this.antiEsp, this.antiFreecam, this.storage};
         this.moduleActive = new boolean[this.modules.length];
         this.jobs = new Job[this.modules.length];
@@ -107,6 +116,7 @@ public final class PlayerVisibility {
         registerPermission(pluginManager, BYPASS_UNDERGROUND_VIEW_DISTANCE, "Bypasses Canvas' underground view distance", children);
         registerPermission(pluginManager, BYPASS_ANTI_BUD, "Bypasses Canvas' anti-bud", children);
         registerPermission(pluginManager, BYPASS_ANTI_STORAGE_ESP, "Bypasses Canvas' storage hiding", children);
+        registerPermission(pluginManager, BYPASS_INVISIBLE_PLAYERS, "Sees invisible players like vanilla does", children);
         if (pluginManager.getPermission(BYPASS_ALL) == null) {
             pluginManager.addPermission(new org.bukkit.permissions.Permission(BYPASS_ALL, "Bypasses all of Canvas' visibility anticheat", org.bukkit.permissions.PermissionDefault.FALSE, children));
         }
@@ -211,6 +221,7 @@ public final class PlayerVisibility {
         }
         this.antiBud.tick(config);
         this.disguises.tick();
+        this.invisiblePlayers.tick();
     }
 
     private void runJob(final Job job, final CameraSnapshot snapshot) {
@@ -277,6 +288,7 @@ public final class PlayerVisibility {
         this.undergroundViewDistance.reset();
         this.antiBud.reset();
         this.disguises.reset();
+        this.invisiblePlayers.reset();
     }
 
     private void refreshPermissions() {
@@ -288,6 +300,7 @@ public final class PlayerVisibility {
         this.bypassUndergroundViewDistance = bukkit.hasPermission(BYPASS_UNDERGROUND_VIEW_DISTANCE);
         this.bypassAntiBud = bukkit.hasPermission(BYPASS_ANTI_BUD);
         this.bypassAntiStorageEsp = bukkit.hasPermission(BYPASS_ANTI_STORAGE_ESP);
+        this.bypassInvisiblePlayers = bukkit.hasPermission(BYPASS_INVISIBLE_PLAYERS);
     }
 
     private void ensurePermissions() {
@@ -324,6 +337,11 @@ public final class PlayerVisibility {
     public boolean bypassesAntiStorageEsp() {
         this.ensurePermissions();
         return this.bypassAntiStorageEsp || this.player.isSpectator();
+    }
+
+    public boolean bypassesInvisiblePlayers() {
+        this.ensurePermissions();
+        return this.bypassInvisiblePlayers || this.player.isSpectator();
     }
 
     // hooks used by the server internals
@@ -395,15 +413,79 @@ public final class PlayerVisibility {
      * Entity tracker check, called every tick for every entity in tracking range. Must be cheap.
      */
     public boolean canSee(final Entity entity) {
-        if (entity.getRootVehicle() == this.player.getRootVehicle()) {
-            // the player's own vehicle and everyone riding along
-            return true;
-        }
         try {
-            return !this.antiFreecam.isEntityMasked(entity) && this.antiEsp.canSee(entity);
+            // anti-ESP keeps its view of hidden invisible players up to date as well, their particles need it
+            final boolean visible = entity.getRootVehicle() == this.player.getRootVehicle()
+                || !this.antiFreecam.isEntityMasked(entity) && this.antiEsp.canSee(entity);
+            return this.invisiblePlayers.maySee(entity) && visible;
         } catch (final RuntimeException thrown) {
             this.failed("canSee", thrown);
             return true;
+        }
+    }
+
+    /**
+     * Called when the entity tracker pairs the entity with this player, with the packet that adds it.
+     *
+     * @param out receives packets that must arrive before it
+     * @return the packet that adds the entity to this player's client
+     */
+    public Packet<ClientGamePacketListener> pairingPacket(final Entity entity, final Packet<ClientGamePacketListener> addEntity,
+                                                          final Consumer<Packet<ClientGamePacketListener>> out) {
+        try {
+            return this.invisiblePlayers.onPairing(entity, addEntity, out);
+        } catch (final RuntimeException thrown) {
+            this.failed("pairingPacket", thrown);
+            return addEntity;
+        }
+    }
+
+    /**
+     * Called when the entity tracker removed the entity from this player's client.
+     */
+    public void onUnpaired(final Entity entity) {
+        try {
+            this.invisiblePlayers.onUnpaired(entity);
+        } catch (final RuntimeException thrown) {
+            this.failed("onUnpaired", thrown);
+        }
+    }
+
+    /**
+     * Called when this player swung at nothing, on the thread owning the player.
+     */
+    public void onMissedSwing() {
+        try {
+            this.invisiblePlayers.onMissedSwing();
+        } catch (final RuntimeException thrown) {
+            this.failed("onMissedSwing", thrown);
+        }
+    }
+
+    /**
+     * Called when this player starts breaking a block, on the thread owning the player.
+     *
+     * @return whether the player hit a hidden player instead, the block must not be broken then
+     */
+    public boolean interceptsDestroy() {
+        try {
+            return this.invisiblePlayers.interceptsDestroy();
+        } catch (final RuntimeException thrown) {
+            this.failed("interceptsDestroy", thrown);
+            return false;
+        }
+    }
+
+    /**
+     * Whether particles at the block position must not be sent to this player, because it can't see the place.
+     * Callable from any thread, off the player's thread only filler counts.
+     */
+    public boolean hidesParticlesAt(final int x, final int y, final int z) {
+        try {
+            return this.config().antiFreecam.hideParticles && this.antiFreecam.hidesPosition(x, y, z);
+        } catch (final RuntimeException thrown) {
+            this.failed("hidesParticlesAt", thrown);
+            return false;
         }
     }
 
@@ -580,6 +662,10 @@ public final class PlayerVisibility {
      */
     public BlockState hiddenStateOf(final ServerLevel level, final int x, final int y, final int z, final BlockState state) {
         try {
+            if (this.antiFreecam.hidesPosition(x, y, z)) {
+                // what the chunk has there
+                return ChunkMasking.filler(level, y >> 4);
+            }
             final BlockState storage = this.storage.hiddenAs(x, y, z, state);
             if (storage != null) {
                 return storage;

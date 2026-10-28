@@ -1,5 +1,6 @@
 package io.canvasmc.canvas.anticheat;
 
+import io.canvasmc.canvas.WorldConfig;
 import io.canvasmc.canvas.anticheat.antibud.BudDisguise;
 import io.canvasmc.canvas.anticheat.disguise.BlockDisguises;
 import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
@@ -7,22 +8,37 @@ import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.game.ClientboundBlockEventPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundExplodePacket;
 import net.minecraft.network.protocol.game.ClientboundLevelEventPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.Mth;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.BrushableBlock;
+import net.minecraft.world.level.block.LevelEvent;
+import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.block.piston.PistonBaseBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.PushReaction;
+import net.minecraft.world.phys.Vec3;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -172,12 +188,18 @@ public final class VisibilityFilters {
     }
 
     /**
-     * Whether pistons treat the block like the filler anti-freecam sends instead of it: a block that moves like stone,
-     * where air or a fluid would end the pushed blocks. Unloaded blocks don't.
+     * Whether pistons treat the block like the filler anti-freecam sends instead of it: air for air filler, otherwise a
+     * block that moves like stone, where air or a fluid would end the pushed blocks. Unloaded blocks don't.
      */
     public static boolean movesLikeFiller(final ServerLevel level, final int x, final int y, final int z) {
         final BlockState state = level.getBlockStateIfLoaded(new BlockPos(x, y, z));
-        return state != null && !state.isAir() && state.getFluidState().isEmpty() && movesLikeStone(level, x, y, z);
+        if (state == null) {
+            return false;
+        }
+        if (level.canvasConfig().anticheat.effective().antiFreecam.filler == WorldConfig.Anticheat.AntiFreecam.Filler.AIR) {
+            return state.isAir();
+        }
+        return !state.isAir() && state.getFluidState().isEmpty() && movesLikeStone(level, x, y, z);
     }
 
     /**
@@ -193,14 +215,20 @@ public final class VisibilityFilters {
     }
 
     /**
-     * Mirrors {@link net.minecraft.server.players.PlayerList#broadcast} for the block break level events, which carry
-     * the id of the broken state. Players that the block was hidden from receive the event for what it was sent as
-     * instead, so they still hear and see a block break without learning what it was, or nothing if it was sent as
-     * air.
+     * Mirrors {@link net.minecraft.server.players.PlayerList#broadcast} for level events.
+     * <ul>
+     *     <li>In places a player can't see (see {@link PlayerVisibility#hidesParticlesAt}), the player gets the sound of
+     *     the event only, or nothing if it is all particles: sounds are public, but the particles would draw what
+     *     happens behind walls.</li>
+     *     <li>The block break events carry the id of the broken state. Players that the block was hidden from receive
+     *     the event for what it was sent as instead, so they still hear and see a block break without learning what it
+     *     was, or nothing if it was sent as air.</li>
+     * </ul>
      */
-    public static void broadcastBlockBreakEvent(final ServerLevel level, final @Nullable Player except, final int type, final BlockPos pos, final int data) {
+    public static void broadcastLevelEvent(final ServerLevel level, final @Nullable Player except, final int type, final BlockPos pos, final int data) {
         final double range = 64.0;
-        final BlockState state = Block.stateById(data);
+        final boolean blockBreak = type == LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK || type == LevelEvent.PARTICLES_DESTROY_BLOCK;
+        final BlockState state = blockBreak ? Block.stateById(data) : null;
         final ClientboundLevelEventPacket packet = new ClientboundLevelEventPacket(type, pos, data, false);
         ClientboundLevelEventPacket disguisedBud = null;
         for (final ServerPlayer player : level.getServer().getPlayerList().getPlayers()) {
@@ -216,12 +244,23 @@ public final class VisibilityFilters {
             if (except != null && !player.getBukkitEntity().canSee(except.getBukkitEntity())) {
                 continue;
             }
-            if (player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)) {
-                final BlockState hiddenAs = player.canvas$visibility.hiddenStateOf(level, pos.getX(), pos.getY(), pos.getZ(), state);
+            final PlayerVisibility visibility = player.canvas$visibility;
+            if (visibility.hidesParticlesAt(pos.getX(), pos.getY(), pos.getZ())) {
+                // the block is hidden, and what it sounds like gives it away as much as what it looks like
+                final Packet<?> sound = soundOfLevelEvent(level, type, pos, data, packet, state == null ? null : hideBlock(level, pos.getY()));
+                if (sound != null) {
+                    player.connection.send(sound);
+                }
+                continue;
+            }
+            if (state == null) {
+                player.connection.send(packet);
+            } else if (visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)) {
+                final BlockState hiddenAs = visibility.hiddenStateOf(level, pos.getX(), pos.getY(), pos.getZ(), state);
                 if (!hiddenAs.isAir()) {
                     player.connection.send(new ClientboundLevelEventPacket(type, pos, Block.getId(hiddenAs), false));
                 }
-            } else if (BudDisguise.isDisguised(state) && player.canvas$visibility.disguisesBudAt(pos.getX(), pos.getY(), pos.getZ())) {
+            } else if (BudDisguise.isDisguised(state) && visibility.disguisesBudAt(pos.getX(), pos.getY(), pos.getZ())) {
                 // the size of a bud shows in its particles and sound
                 if (disguisedBud == null) {
                     disguisedBud = new ClientboundLevelEventPacket(type, pos, Block.getId(BudDisguise.disguise(state)), false);
@@ -231,6 +270,80 @@ public final class VisibilityFilters {
                 player.connection.send(packet);
             }
         }
+    }
+
+    /**
+     * What is left of a level event without its particles, like the client would play it.
+     *
+     * @param original the event as it would be sent
+     * @param heard    for the block break event, the state whose sound is played
+     * @return the sound, the event itself for sound events and events whose sound can't be separated, or {@code null}
+     * if the event is nothing but particles
+     */
+    private static @Nullable Packet<?> soundOfLevelEvent(final ServerLevel level, final int type, final BlockPos pos, final int data,
+                                                         final ClientboundLevelEventPacket original, final @Nullable BlockState heard) {
+        final RandomSource random = level.getRandom();
+        return switch (type) {
+            case LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK -> {
+                if (heard == null || heard.isAir()) {
+                    yield null;
+                }
+                final SoundType sound = heard.getSoundType();
+                yield sound(level, sound.getBreakSound(), SoundSource.BLOCKS, pos, (sound.getVolume() + 1.0F) / 2.0F, sound.getPitch() * 0.8F);
+            }
+            case LevelEvent.PARTICLES_AND_SOUND_DESTROY_PROGRESS -> {
+                // the block being broken sounds like the rock around it, like it does when it breaks
+                final SoundType sound = Block.stateById(data).isAir() ? null : hideBlock(level, pos.getY()).getSoundType();
+                yield sound == null ? null : sound(level, sound.getHitSound(), SoundSource.BLOCKS, pos, (sound.getVolume() + 1.0F) / 8.0F, sound.getPitch() * 0.5F);
+            }
+            case LevelEvent.COMPOSTER_FILL -> sound(level, data > 0 ? SoundEvents.COMPOSTER_FILL_SUCCESS : SoundEvents.COMPOSTER_FILL, SoundSource.BLOCKS, pos, 1.0F, 1.0F);
+            case LevelEvent.LAVA_FIZZ -> sound(level, SoundEvents.LAVA_EXTINGUISH, SoundSource.BLOCKS, pos, 0.5F, 2.6F + (random.nextFloat() - random.nextFloat()) * 0.8F);
+            case LevelEvent.REDSTONE_TORCH_BURNOUT -> sound(level, SoundEvents.REDSTONE_TORCH_BURNOUT, SoundSource.BLOCKS, pos, 0.5F, 2.6F + (random.nextFloat() - random.nextFloat()) * 0.8F);
+            case LevelEvent.END_PORTAL_FRAME_FILL -> sound(level, SoundEvents.END_PORTAL_FRAME_FILL, SoundSource.BLOCKS, pos, 1.0F, 1.0F);
+            case LevelEvent.PARTICLES_AND_SOUND_PLANT_GROWTH -> sound(level, SoundEvents.BONE_MEAL_USE, SoundSource.BLOCKS, pos, 1.0F, 1.0F);
+            case LevelEvent.PARTICLES_DRAGON_FIREBALL_SPLASH -> sound(level, SoundEvents.DRAGON_FIREBALL_EXPLODE, SoundSource.HOSTILE, pos, 1.0F, random.nextFloat() * 0.1F + 0.9F);
+            case LevelEvent.ANIMATION_END_GATEWAY_SPAWN -> sound(level, SoundEvents.END_GATEWAY_SPAWN, SoundSource.BLOCKS, pos, 10.0F, (1.0F + (random.nextFloat() - random.nextFloat()) * 0.2F) * 0.7F);
+            case LevelEvent.PARTICLES_SCULK_CHARGE -> {
+                final int charge = data >> 6;
+                yield charge > 0 ? sound(level, SoundEvents.SCULK_BLOCK_CHARGE, SoundSource.BLOCKS, pos, 0.15F + 0.02F * charge * charge * random.nextFloat(), 0.4F + 0.3F * charge * random.nextFloat()) : null;
+            }
+            case LevelEvent.PARTICLES_AND_SOUND_BRUSH_BLOCK_COMPLETE -> Block.stateById(data).getBlock() instanceof final BrushableBlock brushable
+                ? sound(level, brushable.getBrushCompletedSound(), SoundSource.PLAYERS, pos, 1.0F, 1.0F) : null;
+            case LevelEvent.DRIPSTONE_DRIP, LevelEvent.PARTICLES_SHOOT_SMOKE, LevelEvent.PARTICLES_SPELL_POTION_SPLASH,
+                 LevelEvent.PARTICLES_EYE_OF_ENDER_DEATH, LevelEvent.PARTICLES_MOBBLOCK_SPAWN, LevelEvent.PARTICLES_INSTANT_POTION_SPLASH,
+                 LevelEvent.PARTICLES_DRAGON_BLOCK_BREAK, LevelEvent.PARTICLES_WATER_EVAPORATING, LevelEvent.PARTICLES_SHOOT_WHITE_SMOKE,
+                 LevelEvent.PARTICLES_BEE_GROWTH, LevelEvent.PARTICLES_TURTLE_EGG_PLACEMENT, LevelEvent.PARTICLES_SMASH_ATTACK,
+                 LevelEvent.PARTICLES_DESTROY_BLOCK, LevelEvent.PARTICLES_DRAGON_EGG_TELEPORT, LevelEvent.PARTICLES_SHULKER_TELEPORT,
+                 LevelEvent.PARTICLES_CONSUME_EFFECT_TELEPORT, LevelEvent.PARTICLES_ENDERMAN_TELEPORT, LevelEvent.PARTICLES_DESTROY_PROGRESS,
+                 LevelEvent.PARTICLES_ELECTRIC_SPARK, LevelEvent.PARTICLES_WAX_ON, LevelEvent.PARTICLES_WAX_OFF, LevelEvent.PARTICLES_SCRAPE,
+                 LevelEvent.PARTICLES_SCULK_SHRIEK, LevelEvent.PARTICLES_EGG_CRACK -> null;
+            // sounds, and the trial spawner and vault animations, whose sounds can't be told apart from their particles
+            default -> original;
+        };
+    }
+
+    private static ClientboundSoundPacket sound(final ServerLevel level, final SoundEvent sound, final SoundSource source, final BlockPos pos, final float volume, final float pitch) {
+        return sound(level, BuiltInRegistries.SOUND_EVENT.wrapAsHolder(sound), source, pos, volume, pitch);
+    }
+
+    private static ClientboundSoundPacket sound(final ServerLevel level, final Holder<SoundEvent> sound, final SoundSource source, final BlockPos pos, final float volume, final float pitch) {
+        return new ClientboundSoundPacket(sound, source, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, volume, pitch, level.getRandom().nextLong());
+    }
+
+    /**
+     * The explosion as a player gets it: in a place the player can't see, only its sound, unless it pushes the player.
+     */
+    public static @Nullable Packet<ClientGamePacketListener> explosionFor(final ServerPlayer player, final ClientboundExplodePacket packet) {
+        final Vec3 center = packet.center();
+        if (packet.playerKnockback().isPresent() || !player.canvas$visibility.hidesParticlesAt(Mth.floor(center.x), Mth.floor(center.y), Mth.floor(center.z))) {
+            return packet;
+        }
+        if (!packet.playSound()) {
+            return null;
+        }
+        final RandomSource random = player.level().getRandom();
+        return new ClientboundSoundPacket(packet.explosionSound(), SoundSource.BLOCKS, center.x, center.y, center.z, 4.0F,
+            (1.0F + (random.nextFloat() - random.nextFloat()) * 0.2F) * 0.7F, random.nextLong());
     }
 
     /**

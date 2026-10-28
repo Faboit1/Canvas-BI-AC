@@ -1,5 +1,6 @@
 package io.canvasmc.canvas.anticheat.freecam;
 
+import io.canvasmc.canvas.WorldConfig;
 import io.papermc.paper.antixray.ChunkPacketInfo;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -24,9 +25,11 @@ import org.jspecify.annotations.Nullable;
 /**
  * Writes masked chunk sections into chunk packets and strips their light.
  * <p>
- * A masked section is sent as a section completely filled with the natural stone of its dimension, using the
- * single value palette, so it costs a few bytes and, having no bits per block, is skipped by Paper's anti-xray.
- * Air is never used as filler: players would fall into it, and light would outline caves. Masked sections get the
+ * A masked section is sent as a section completely filled with filler, using the single value palette, so it costs a
+ * few bytes and, having no bits per block, is skipped by Paper's anti-xray. The filler is either void air, which
+ * clients treat like air while Paper's anti-xray counts it as solid, or the natural stone of the dimension (see
+ * {@link WorldConfig.Anticheat.AntiFreecam#filler}). Players never get to fall into air filler: everything around
+ * them and their cameras is sent real, and its light is dark, so it can't outline caves either. Masked sections get the
  * biomes of the chunk's top section, which is never masked, since underground biomes (deep dark, lush caves) would
  * give away what lies below, unless they are next to a section with visible blocks: the client spreads biomes over a
  * few blocks (lookup jitter, color blending), so those decide the colors of visible blocks.
@@ -43,6 +46,7 @@ public final class ChunkMasking {
     private static final int DEEPSLATE = Block.getId(Blocks.DEEPSLATE.defaultBlockState());
     private static final int NETHERRACK = Block.getId(Blocks.NETHERRACK.defaultBlockState());
     private static final int END_STONE = Block.getId(Blocks.END_STONE.defaultBlockState());
+    private static final int VOID_AIR = Block.getId(Blocks.VOID_AIR.defaultBlockState());
 
     private ChunkMasking() {
     }
@@ -56,11 +60,21 @@ public final class ChunkMasking {
     }
 
     private static int fillerId(final Level level, final int sectionY) {
+        if (level.canvasConfig().anticheat.effective().antiFreecam.filler == WorldConfig.Anticheat.AntiFreecam.Filler.AIR) {
+            return VOID_AIR;
+        }
         return switch (level.getWorld().getEnvironment()) {
             case NETHER -> NETHERRACK;
             case THE_END -> END_STONE;
             default -> sectionY < 0 ? DEEPSLATE : STONE;
         };
+    }
+
+    /**
+     * @return what blocks the player can't see are sent as in the section
+     */
+    public static BlockState filler(final Level level, final int sectionY) {
+        return Block.stateById(fillerId(level, sectionY));
     }
 
     /**
@@ -163,6 +177,7 @@ public final class ChunkMasking {
             return new MaskedBlocks(states, section.getBiomes(), (short) nonEmpty, (short) fluids);
         }
         final int fillerId = data.palette().idFor(filler, PaletteResize.noResizeExpected());
+        final boolean fillerIsAir = filler.isAir();
         for (int word = 0; word < CellVisibility.WORDS; ++word) {
             for (long hidden = ~visible[word]; hidden != 0L; hidden &= hidden - 1L) {
                 final int index = word << 6 | Long.numberOfTrailingZeros(hidden);
@@ -172,8 +187,8 @@ public final class ChunkMasking {
                 }
                 final BlockState old = data.palette().valueFor(id);
                 data.storage().set(index, fillerId);
-                if (old.isAir()) {
-                    ++nonEmpty;
+                if (old.isAir() != fillerIsAir) {
+                    nonEmpty += fillerIsAir ? -1 : 1;
                 }
                 if (!old.getFluidState().isEmpty()) {
                     --fluids;
@@ -201,17 +216,18 @@ public final class ChunkMasking {
     }
 
     /**
-     * Writes the section as solid filler, in the network format of {@link LevelChunkSection#write}.
+     * Writes the section as nothing but filler, in the network format of {@link LevelChunkSection#write}.
      *
      * @param maskBiomes whether to write the biomes of the top section instead of the section's own, which only
      *                   sections far enough from anything visible may get: the client spreads biomes over a few blocks
      */
     public static void writeMaskedSection(final FriendlyByteBuf buffer, final LevelChunk chunk, final LevelChunkSection section, final int sectionIndex, final boolean maskBiomes) {
-        buffer.writeShort(16 * 16 * 16);
+        final int filler = fillerId(chunk.getLevel(), chunk.getMinSectionY() + sectionIndex);
+        buffer.writeShort(filler == VOID_AIR ? 0 : 16 * 16 * 16);
         buffer.writeShort(0);
         // single value palette: no bits per entry and no data array
         buffer.writeByte(0);
-        buffer.writeVarInt(fillerId(chunk.getLevel(), chunk.getMinSectionY() + sectionIndex));
+        buffer.writeVarInt(filler);
         (maskBiomes ? biomeSource(chunk) : section).getBiomes().write(buffer, null, sectionIndex);
     }
 

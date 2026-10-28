@@ -1961,6 +1961,29 @@ public final class FreecamGuard implements VisibilityModule {
     }
 
     /**
+     * Whether the player can't see the position: the client has it as filler, or, in per-block mode, it can't be seen
+     * from any camera right now. Unlike {@link #withholdsUpdate} this changes nothing. Off the player's thread, only
+     * filler counts.
+     */
+    public boolean hidesPosition(final int x, final int y, final int z) {
+        if (this.isMasked(x, y, z)) {
+            return true;
+        }
+        if (!this.perBlock) {
+            return false;
+        }
+        final ServerPlayer player = this.owner.player;
+        final Pvs pvs = this.current;
+        final ServerLevel level = player.level();
+        if (pvs == null || !pvs.perBlock || pvs.level != level || this.boxLevel != level || contains(this.blockBox, x, y, z)
+            || !TickThread.isTickThreadFor(player) || pvs.mayShow(x, y, z)) {
+            return false;
+        }
+        final Overlay overlay = this.overlay;
+        return overlay == null || !overlay.shows(level, x, y, z);
+    }
+
+    /**
      * Leaves the masked sections and the light of filler blocks out of a light update. May be called from any thread.
      */
     public @Nullable ClientboundLightUpdatePacket filterLightUpdate(final ClientboundLightUpdatePacket packet) {
