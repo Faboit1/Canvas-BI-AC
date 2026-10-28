@@ -26,7 +26,7 @@ index 819d4d0307f53e40cb5de3fc6517771e0b3fe859..cfb879aa5dbac3193ea5ab7378860123
 +    // Canvas end - visibility anticheat
  }
 diff --git a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
-index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf997517eed 100644
+index 86e7f42bd8ba10ec92a18889effa4b341edebc47..e010ac4578a81564e1727cf26994a07249bc9bce 100644
 --- a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
 +++ b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
 @@ -176,9 +176,29 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
@@ -46,12 +46,12 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf9
 +     */
 +    public io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation rayTraceObfuscation(Level level) {
 +        final io.canvasmc.canvas.WorldConfig canvasConfig = level.canvasConfig();
-+        if (engineMode != EngineMode.HIDE || canvasConfig == null || !canvasConfig.anticheat.rayTraceAntiXray.enabled) {
++        if (engineMode != EngineMode.HIDE || canvasConfig == null || !canvasConfig.anticheat.effective().rayTraceAntiXray.enabled) {
 +            return null;
 +        }
 +        io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation ret = this.rayTraceObfuscation;
-+        if (ret == null || ret.config != canvasConfig.anticheat.rayTraceAntiXray) {
-+            this.rayTraceObfuscation = ret = new io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation(canvasConfig.anticheat.rayTraceAntiXray, obfuscateGlobal);
++        if (ret == null || ret.config != canvasConfig.anticheat.effective().rayTraceAntiXray) {
++            this.rayTraceObfuscation = ret = new io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation(canvasConfig.anticheat.effective().rayTraceAntiXray, obfuscateGlobal);
 +        }
 +        return ret;
 +    }

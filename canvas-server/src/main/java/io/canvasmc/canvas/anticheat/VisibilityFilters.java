@@ -1,7 +1,7 @@
 package io.canvasmc.canvas.anticheat;
 
-import io.canvasmc.canvas.anticheat.antibud.AntiBud;
 import io.canvasmc.canvas.anticheat.antibud.BudDisguise;
+import io.canvasmc.canvas.anticheat.disguise.BlockDisguises;
 import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
 import java.util.ArrayList;
 import java.util.List;
@@ -110,15 +110,15 @@ public final class VisibilityFilters {
 
     /**
      * Sends a light update to every player, leaving out the sections each player must not see, with the light of the
-     * buds disguised from them corrected.
+     * blocks disguised from them corrected.
      */
     public static void broadcastLightUpdate(final Level level, final List<ServerPlayer> players, final ClientboundLightUpdatePacket packet) {
         if (players.isEmpty()) {
             return;
         }
-        final AntiBud.LightScan budScan = AntiBud.scan((ServerLevel) level, packet);
+        final BlockDisguises.LightScan disguiseScan = BlockDisguises.scan((ServerLevel) level, packet);
         for (final ServerPlayer player : players) {
-            final ClientboundLightUpdatePacket filtered = player.canvas$visibility.filterLightUpdate(packet, budScan);
+            final ClientboundLightUpdatePacket filtered = player.canvas$visibility.filterLightUpdate(packet, disguiseScan);
             if (filtered != null) {
                 player.connection.send(filtered);
             }
@@ -194,14 +194,14 @@ public final class VisibilityFilters {
 
     /**
      * Mirrors {@link net.minecraft.server.players.PlayerList#broadcast} for the block break level events, which carry
-     * the id of the broken state. Players that the block was hidden from receive the event for the hide block
-     * instead, so they still hear and see a block break without learning what it was.
+     * the id of the broken state. Players that the block was hidden from receive the event for what it was sent as
+     * instead, so they still hear and see a block break without learning what it was, or nothing if it was sent as
+     * air.
      */
     public static void broadcastBlockBreakEvent(final ServerLevel level, final @Nullable Player except, final int type, final BlockPos pos, final int data) {
         final double range = 64.0;
         final BlockState state = Block.stateById(data);
         final ClientboundLevelEventPacket packet = new ClientboundLevelEventPacket(type, pos, data, false);
-        ClientboundLevelEventPacket disguised = null;
         ClientboundLevelEventPacket disguisedBud = null;
         for (final ServerPlayer player : level.getServer().getPlayerList().getPlayers()) {
             if (player == except || player.level() != level) {
@@ -217,10 +217,10 @@ public final class VisibilityFilters {
                 continue;
             }
             if (player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)) {
-                if (disguised == null) {
-                    disguised = new ClientboundLevelEventPacket(type, pos, Block.getId(hideBlock(level, pos.getY())), false);
+                final BlockState hiddenAs = player.canvas$visibility.hiddenStateOf(level, pos.getX(), pos.getY(), pos.getZ(), state);
+                if (!hiddenAs.isAir()) {
+                    player.connection.send(new ClientboundLevelEventPacket(type, pos, Block.getId(hiddenAs), false));
                 }
-                player.connection.send(disguised);
             } else if (BudDisguise.isDisguised(state) && player.canvas$visibility.disguisesBudAt(pos.getX(), pos.getY(), pos.getZ())) {
                 // the size of a bud shows in its particles and sound
                 if (disguisedBud == null) {
@@ -241,7 +241,7 @@ public final class VisibilityFilters {
     public static ClientboundBlockUpdatePacket blockUpdateFor(final ServerPlayer player, final Level level, final BlockPos pos) {
         final BlockState state = level.getBlockState(pos);
         if (player.canvas$visibility.isBlockHidden(pos.getX(), pos.getY(), pos.getZ(), state)) {
-            return new ClientboundBlockUpdatePacket(pos, hideBlock(level, pos.getY()));
+            return new ClientboundBlockUpdatePacket(pos, player.canvas$visibility.hiddenStateOf((ServerLevel) level, pos.getX(), pos.getY(), pos.getZ(), state));
         }
         return new ClientboundBlockUpdatePacket(pos, player.canvas$visibility.disguiseBlock(pos.getX(), pos.getY(), pos.getZ(), state));
     }
@@ -254,7 +254,7 @@ public final class VisibilityFilters {
      * @param opaque whether the block occludes now
      */
     public static void onOpacityChange(final ServerLevel level, final BlockPos pos, final boolean opaque) {
-        if (!level.canvasConfig().anticheat.antiFreecam.enabled) {
+        if (!level.canvasConfig().anticheat.effective().antiFreecam.enabled) {
             return;
         }
         final List<ServerPlayer> players = level.getChunkSource().chunkMap.getPlayers(new ChunkPos(pos.getX() >> 4, pos.getZ() >> 4), false);
