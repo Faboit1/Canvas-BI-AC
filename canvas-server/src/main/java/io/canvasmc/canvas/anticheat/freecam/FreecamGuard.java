@@ -9,18 +9,20 @@ import io.canvasmc.canvas.anticheat.AnticheatExecutor;
 import io.canvasmc.canvas.anticheat.CameraSnapshot;
 import io.canvasmc.canvas.anticheat.PlayerVisibility;
 import io.canvasmc.canvas.anticheat.VisibilityModule;
-import io.canvasmc.canvas.anticheat.antibud.AntiBud;
+import io.canvasmc.canvas.anticheat.disguise.ChunkRewrite;
 import io.canvasmc.canvas.anticheat.antixray.RayTraceAntiXray;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.shorts.ShortArraySet;
+import it.unimi.dsi.fastutil.shorts.ShortIterator;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket;
@@ -1151,23 +1153,23 @@ public final class FreecamGuard implements VisibilityModule {
      * visible to them masked.
      */
     /**
-     * @param buds the buds anti-bud disguises in the chunk, see {@link AntiBud#prepareChunk}
+     * @param disguises the blocks sent as something else, see {@link io.canvasmc.canvas.anticheat.disguise.BlockDisguises#prepareChunk}
      */
-    public ClientboundLevelChunkWithLightPacket createChunkPacket(final LevelChunk chunk, final boolean modifyBlocks, final AntiBud.@Nullable ChunkDisguise buds) {
+    public ClientboundLevelChunkWithLightPacket createChunkPacket(final LevelChunk chunk, final boolean modifyBlocks, final @Nullable ChunkRewrite disguises) {
         final WorldConfig.Anticheat config = this.owner.config();
         if (!this.isActive(config)) {
-            return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks, 0L, null, 0L, buds);
+            return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks, 0L, null, 0L, disguises);
         }
         this.updateMode(config.antiFreecam);
         if (this.perBlock) {
-            return this.createBlockMaskedPacket(chunk, modifyBlocks, buds);
+            return this.createBlockMaskedPacket(chunk, modifyBlocks, disguises);
         }
         final long masked = this.computeMask(chunk);
         return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks, masked, null,
-            masked & ~this.nearVisible(chunk, ~masked), buds);
+            masked & ~this.nearVisible(chunk, ~masked), disguises);
     }
 
-    private ClientboundLevelChunkWithLightPacket createBlockMaskedPacket(final LevelChunk chunk, final boolean modifyBlocks, final AntiBud.@Nullable ChunkDisguise buds) {
+    private ClientboundLevelChunkWithLightPacket createBlockMaskedPacket(final LevelChunk chunk, final boolean modifyBlocks, final @Nullable ChunkRewrite disguises) {
         final Level level = chunk.getLevel();
         final int chunkX = chunk.getPos().x();
         final int chunkZ = chunk.getPos().z();
@@ -1206,7 +1208,7 @@ public final class FreecamGuard implements VisibilityModule {
         }
         final long all = sections == 64 ? -1L : (1L << sections) - 1L;
         return new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null, modifyBlocks, masked, cells,
-            masked & ~this.nearVisible(chunk, all & ~masked), buds);
+            masked & ~this.nearVisible(chunk, all & ~masked), disguises);
     }
 
     /**
@@ -1658,6 +1660,17 @@ public final class FreecamGuard implements VisibilityModule {
             final LevelChunkSection section = chunk.getSections()[index];
             final ClientboundSectionBlocksUpdatePacket packet = new ClientboundSectionBlocksUpdatePacket(sectionPos, positions, section)
                 .canvas$filter(this.owner);
+            // storage hiding withholds hidden storage, whose filler the client must get instead of this filler
+            for (final ShortIterator iterator = positions.iterator(); iterator.hasNext(); ) {
+                final short packed = iterator.nextShort();
+                final int x = sectionPos.relativeToBlockX(packed);
+                final int y = sectionPos.relativeToBlockY(packed);
+                final int z = sectionPos.relativeToBlockZ(packed);
+                if (this.owner.storage.isHiddenAt(x, y, z)) {
+                    final BlockState state = section.getBlockState(x & 15, y & 15, z & 15);
+                    player.connection.send(new ClientboundBlockUpdatePacket(new BlockPos(x, y, z), this.owner.hiddenStateOf((ServerLevel) level, x, y, z, state)));
+                }
+            }
             if (packet == null) {
                 continue;
             }
@@ -1945,6 +1958,29 @@ public final class FreecamGuard implements VisibilityModule {
         }
         this.setBlock(entry, x, y, z, false);
         return true;
+    }
+
+    /**
+     * Whether the player can't see the position: the client has it as filler, or, in per-block mode, it can't be seen
+     * from any camera right now. Unlike {@link #withholdsUpdate} this changes nothing. Off the player's thread, only
+     * filler counts.
+     */
+    public boolean hidesPosition(final int x, final int y, final int z) {
+        if (this.isMasked(x, y, z)) {
+            return true;
+        }
+        if (!this.perBlock) {
+            return false;
+        }
+        final ServerPlayer player = this.owner.player;
+        final Pvs pvs = this.current;
+        final ServerLevel level = player.level();
+        if (pvs == null || !pvs.perBlock || pvs.level != level || this.boxLevel != level || contains(this.blockBox, x, y, z)
+            || !TickThread.isTickThreadFor(player) || pvs.mayShow(x, y, z)) {
+            return false;
+        }
+        final Overlay overlay = this.overlay;
+        return overlay == null || !overlay.shows(level, x, y, z);
     }
 
     /**

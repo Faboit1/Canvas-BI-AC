@@ -26,10 +26,20 @@ index 819d4d0307f53e40cb5de3fc6517771e0b3fe859..cfb879aa5dbac3193ea5ab7378860123
 +    // Canvas end - visibility anticheat
  }
 diff --git a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
-index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf997517eed 100644
+index 86e7f42bd8ba10ec92a18889effa4b341edebc47..868301b3c57f6a3f10967ddcb0699858dc5f57cc 100644
 --- a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
 +++ b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
-@@ -176,9 +176,29 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+@@ -140,6 +140,9 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+                 // shulker box checks TE.
+             }
+         }
++        // Canvas start - visibility anticheat - anti-freecam's air filler stands for blocks the player can't see, which hide what is next to them
++        solidGlobal[GLOBAL_BLOCKSTATE_PALETTE.idFor(Blocks.VOID_AIR.defaultBlockState(), PaletteResize.noResizeExpected())] = true;
++        // Canvas end - visibility anticheat
+ 
+         maxBlockHeightUpdatePosition = maxBlockHeight + updateRadius - 1;
+     }
+@@ -176,9 +179,29 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
      @Override
      public ChunkPacketInfoAntiXray getChunkPacketInfo(LevelChunk chunk) {
          // Return a new instance to collect data and objects in the right state while creating the chunk packet for thread safe access later
@@ -46,12 +56,12 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf9
 +     */
 +    public io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation rayTraceObfuscation(Level level) {
 +        final io.canvasmc.canvas.WorldConfig canvasConfig = level.canvasConfig();
-+        if (engineMode != EngineMode.HIDE || canvasConfig == null || !canvasConfig.anticheat.rayTraceAntiXray.enabled) {
++        if (engineMode != EngineMode.HIDE || canvasConfig == null || !canvasConfig.anticheat.effective().rayTraceAntiXray.enabled) {
 +            return null;
 +        }
 +        io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation ret = this.rayTraceObfuscation;
-+        if (ret == null || ret.config != canvasConfig.anticheat.rayTraceAntiXray) {
-+            this.rayTraceObfuscation = ret = new io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation(canvasConfig.anticheat.rayTraceAntiXray, obfuscateGlobal);
++        if (ret == null || ret.config != canvasConfig.anticheat.effective().rayTraceAntiXray) {
++            this.rayTraceObfuscation = ret = new io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation(canvasConfig.anticheat.effective().rayTraceAntiXray, obfuscateGlobal);
 +        }
 +        return ret;
 +    }
@@ -60,7 +70,7 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf9
      @Override
      public void modifyBlocks(ClientboundLevelChunkWithLightPacket chunkPacket, ChunkPacketInfo<BlockState> chunkPacketInfo) {
          if (!(chunkPacketInfo instanceof ChunkPacketInfoAntiXray)) {
-@@ -216,6 +236,10 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+@@ -216,6 +239,10 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
      private static final ThreadLocal<boolean[][]> NEXT_NEXT = ThreadLocal.withInitial(() -> new boolean[16][16]);
  
      public void obfuscate(ChunkPacketInfoAntiXray chunkPacketInfoAntiXray) {
@@ -71,7 +81,7 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf9
          int[] presetBlockStateBits = this.presetBlockStateBits.get();
          boolean[] solid = SOLID.get();
          boolean[] obfuscate = OBFUSCATE.get();
-@@ -387,6 +411,14 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+@@ -387,6 +414,14 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
              }
          }
  
@@ -86,7 +96,7 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..be42f660e7ce9667a0d07b193e8a9cf9
          chunkPacketInfoAntiXray.getChunkPacket().setReady(true);
      }
  
-@@ -665,7 +697,20 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+@@ -665,7 +700,20 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
          }
      }
  

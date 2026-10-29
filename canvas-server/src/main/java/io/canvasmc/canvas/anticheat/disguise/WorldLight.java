@@ -1,9 +1,9 @@
-package io.canvasmc.canvas.anticheat.antibud;
+package io.canvasmc.canvas.anticheat.disguise;
 
 import ca.spottedleaf.moonrise.patches.starlight.blockstate.StarlightAbstractBlockState;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongSet;
+import it.unimi.dsi.fastutil.longs.Long2ByteMap;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import net.minecraft.server.level.ServerLevel;
@@ -19,14 +19,16 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 import org.jspecify.annotations.Nullable;
 
 /**
- * The block light and blocks of a level as {@link BudLight} sees them, with the disguised buds replaced by the small
- * buds they are sent as. Light moves between blocks by Starlight's rules: through faces that the face occlusion
- * shapes of the two blocks don't cover together, losing the light dampening of the block it enters, at least 1.
+ * The block light and blocks of a level as {@link LoweredLight} sees them, with the disguised blocks emitting the
+ * light of what they are sent as. Light moves between the real blocks by Starlight's rules: through faces that the
+ * face occlusion shapes of the two blocks don't cover together, losing the light dampening of the block it enters, at
+ * least 1. A disguise that lets less light through than the real block (hidden storage sent as stone) is ignored
+ * there, the lowering only handles emission.
  * <p>
  * Reads the loaded chunks directly, like {@link OcclusionAccess}, and the light engine's published light, so it can
  * be used from any thread. One instance per computation.
  */
-final class WorldLight implements BudLight.Medium {
+final class WorldLight implements LoweredLight.Medium {
 
     private static final Direction[] DIRECTIONS = {Direction.WEST, Direction.EAST, Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH};
     private static final byte[] NOT_LOADED = new byte[0];
@@ -34,7 +36,7 @@ final class WorldLight implements BudLight.Medium {
 
     private final OcclusionAccess access;
     private final LayerLightEventListener blockLight;
-    private final LongSet disguised;
+    private final Long2ByteMap emissions;
     private final int minY;
     private final int maxY;
     private final int minSectionY;
@@ -43,12 +45,13 @@ final class WorldLight implements BudLight.Medium {
     private final Long2ObjectOpenHashMap<byte[]> nibbles = new Long2ObjectOpenHashMap<>();
 
     /**
-     * @param disguised the positions of the buds that are disguised, packed by {@link BudLight#pack}
+     * @param emissions the light the disguised blocks emit as what they are sent as, by position packed by
+     *                  {@link LoweredLight#pack}
      */
-    WorldLight(final ServerLevel level, final LongSet disguised) {
+    WorldLight(final ServerLevel level, final Long2ByteMap emissions) {
         this.access = new OcclusionAccess(level);
         this.blockLight = level.getLightEngine().getLayerListener(LightLayer.BLOCK);
-        this.disguised = disguised;
+        this.emissions = emissions;
         this.minY = level.getMinY();
         this.maxY = level.getMaxY();
         this.minSectionY = level.getMinSectionY();
@@ -90,14 +93,12 @@ final class WorldLight implements BudLight.Medium {
             // the light sections above and below the world
             return AIR;
         }
-        final BlockState state;
         try {
-            state = sections[(y >> 4) - this.minSectionY].getBlockState(x & 15, y & 15, z & 15);
+            return sections[(y >> 4) - this.minSectionY].getBlockState(x & 15, y & 15, z & 15);
         } catch (final MissingPaletteEntryException ignored) {
             // racing a palette resize of a chunk owned by another region
             return null;
         }
-        return this.disguised.contains(BudLight.pack(x, y, z)) ? BudDisguise.disguise(state) : state;
     }
 
     private static boolean isConditionallyFullOpaque(final BlockState state) {
@@ -107,7 +108,7 @@ final class WorldLight implements BudLight.Medium {
     @Override
     public int cost(final int x, final int y, final int z, final int direction) {
         final BlockState from = this.state(x, y, z);
-        final BlockState to = this.state(x + BudLight.DX[direction], y + BudLight.DY[direction], z + BudLight.DZ[direction]);
+        final BlockState to = this.state(x + LoweredLight.DX[direction], y + LoweredLight.DY[direction], z + LoweredLight.DZ[direction]);
         if (from == null || to == null) {
             return -1;
         }
@@ -124,6 +125,10 @@ final class WorldLight implements BudLight.Medium {
 
     @Override
     public int emission(final int x, final int y, final int z) {
+        final long pos = LoweredLight.pack(x, y, z);
+        if (this.emissions.containsKey(pos)) {
+            return this.emissions.get(pos);
+        }
         final BlockState state = this.state(x, y, z);
         return state == null ? 0 : state.getLightEmission();
     }

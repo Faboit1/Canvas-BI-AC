@@ -174,7 +174,7 @@ index 9c83ad4d41a8b97331c94e3ea260e04096caca5b..1d3f5d98c24771b1cf09eb8cb4585803
      // Paper end - Optimize network
  }
 diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbdecd6e434b 100644
+index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..88a3934b6b949393591bdfb33a68c51b4615244d 100644
 --- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 +++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 @@ -60,6 +60,39 @@ public class ClientboundLevelChunkPacketData {
@@ -217,7 +217,7 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbde
  
      @Deprecated @io.papermc.paper.annotation.DoNotUse // Paper - Anti-Xray - Add chunk packet info
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk) {
-@@ -68,20 +101,53 @@ public class ClientboundLevelChunkPacketData {
+@@ -68,20 +101,54 @@ public class ClientboundLevelChunkPacketData {
      }
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
          // Paper end - Anti-Xray - Add chunk packet info
@@ -244,13 +244,13 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbde
 +    }
 +
 +    /**
-+     * @param buds the buds to write as the small buds anti-bud disguises them as, see
-+     *             {@link io.canvasmc.canvas.anticheat.antibud.AntiBud#prepareChunk}
++     * @param disguises the blocks to write as something else (disguised buds, hidden storage), see
++     *                  {@link io.canvasmc.canvas.anticheat.disguise.BlockDisguises#prepareChunk}
 +     */
-+    public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final long maskedSections, final long @Nullable [] @Nullable [] visibleCells, final long maskedBiomes, final io.canvasmc.canvas.anticheat.antibud.AntiBud.@Nullable ChunkDisguise buds) {
++    public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final long maskedSections, final long @Nullable [] @Nullable [] visibleCells, final long maskedBiomes, final io.canvasmc.canvas.anticheat.disguise.@Nullable ChunkRewrite disguises) {
 +        this.canvas$maskedSections = maskedSections;
 +        this.canvas$visibleCells = visibleCells;
-+        final io.canvasmc.canvas.anticheat.freecam.ChunkMasking.@Nullable MaskedBlocks[] maskedBlocks = maskBlocks(levelChunk, maskedSections, visibleCells, buds);
++        final io.canvasmc.canvas.anticheat.freecam.ChunkMasking.@Nullable MaskedBlocks[] maskedBlocks = maskBlocks(levelChunk, maskedSections, visibleCells, disguises);
 +        // Canvas end - visibility anticheat - anti-freecam
 +        this.canvas$chunkPacketInfo = chunkPacketInfo; // Canvas - visibility anticheat
          this.heightmaps = levelChunk.getHeightmaps()
@@ -270,10 +270,11 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbde
  
          for (BlockEntity blockEntity : levelChunk.canvas$getAllBlockEntities()) { // Canvas - optimize block entity fetching
 +            if ((maskedSections != 0L || visibleCells != null) && io.canvasmc.canvas.anticheat.freecam.ChunkMasking.isMasked(maskedSections, visibleCells, levelChunk, blockEntity.getBlockPos().getX(), blockEntity.getBlockPos().getY(), blockEntity.getBlockPos().getZ())) continue; // Canvas - visibility anticheat - anti-freecam
++            if (disguises != null && disguises.hidesBlockEntity(blockEntity.getBlockPos().getX(), blockEntity.getBlockPos().getY(), blockEntity.getBlockPos().getZ())) continue; // Canvas - visibility anticheat - hidden storage
              // Paper start - Handle oversized block entities in chunks
              if (++totalTileEntities > BLOCK_ENTITY_LIMIT) {
                  net.minecraft.network.protocol.Packet<ClientGamePacketListener> packet = blockEntity.getUpdatePacket(); // Canvas - optimize block entity fetching
-@@ -101,14 +167,51 @@ public class ClientboundLevelChunkPacketData {
+@@ -101,14 +168,51 @@ public class ClientboundLevelChunkPacketData {
          this.heightmaps = heightmaps;
          this.buffer = buffer;
          this.blockEntitiesData = blockEntitiesData;
@@ -286,8 +287,8 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbde
  
 -    private static int calculateChunkSize(final LevelChunk chunk) {
 +    // Canvas start - visibility anticheat - anti-freecam
-+    private static io.canvasmc.canvas.anticheat.freecam.ChunkMasking.@Nullable MaskedBlocks @Nullable [] maskBlocks(final LevelChunk chunk, final long maskedSections, final long @Nullable [] @Nullable [] visibleCells, final io.canvasmc.canvas.anticheat.antibud.AntiBud.@Nullable ChunkDisguise buds) {
-+        if (visibleCells == null && buds == null) {
++    private static io.canvasmc.canvas.anticheat.freecam.ChunkMasking.@Nullable MaskedBlocks @Nullable [] maskBlocks(final LevelChunk chunk, final long maskedSections, final long @Nullable [] @Nullable [] visibleCells, final io.canvasmc.canvas.anticheat.disguise.@Nullable ChunkRewrite disguises) {
++        if (visibleCells == null && disguises == null) {
 +            return null;
 +        }
 +        final LevelChunkSection[] sections = chunk.getSections();
@@ -298,9 +299,9 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbde
 +                continue;
 +            }
 +            final long[] visible = visibleCells == null || sectionIndex >= visibleCells.length ? null : visibleCells[sectionIndex];
-+            final int[] disguised = buds == null ? null : buds.budsIn(sectionIndex);
++            final int[] disguised = disguises == null ? null : disguises.indicesIn(sectionIndex);
 +            if (visible != null || disguised != null) {
-+                ret[sectionIndex] = io.canvasmc.canvas.anticheat.freecam.ChunkMasking.maskBlocks(chunk, sections[sectionIndex], sectionIndex, visible, disguised);
++                ret[sectionIndex] = io.canvasmc.canvas.anticheat.freecam.ChunkMasking.maskBlocks(chunk, sections[sectionIndex], sectionIndex, visible, disguised, disguises == null ? null : disguises.statesIn(sectionIndex));
 +            }
 +        }
 +        return ret;
@@ -328,7 +329,7 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbde
  
          return total;
      }
-@@ -125,8 +228,23 @@ public class ClientboundLevelChunkPacketData {
+@@ -125,8 +229,23 @@ public class ClientboundLevelChunkPacketData {
          extractChunkData(buffer, chunk, null);
      }
      public static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
@@ -353,7 +354,7 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..f2531a2da3ec30a6d537721b69bdbbde
              chunkSectionIndex++;
              // Paper end - Anti-Xray - Add chunk packet info
 diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
-index 1b83d541378c98e3517904973e3ea4e33098a914..7bc349174832744a718ab8db45466dfeb12208d2 100644
+index 1b83d541378c98e3517904973e3ea4e33098a914..86698336508a7a347adc1818d08ece459a60387e 100644
 --- a/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
 +++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkWithLightPacket.java
 @@ -53,13 +53,66 @@ public record ClientboundLevelChunkWithLightPacket(int x, int z, ClientboundLeve
@@ -398,8 +399,8 @@ index 1b83d541378c98e3517904973e3ea4e33098a914..7bc349174832744a718ab8db45466dfe
 +    }
 +
 +    /**
-+     * @param buds the buds sent disguised as small buds and the block light that goes with them, see
-+     *             {@link io.canvasmc.canvas.anticheat.antibud.AntiBud#prepareChunk}
++     * @param disguises the blocks sent as something else (disguised buds, hidden storage) and the block light that
++     *                  goes with them, see {@link io.canvasmc.canvas.anticheat.disguise.BlockDisguises#prepareChunk}
 +     */
 +    public ClientboundLevelChunkWithLightPacket(
 +        final LevelChunk levelChunk,
@@ -410,7 +411,7 @@ index 1b83d541378c98e3517904973e3ea4e33098a914..7bc349174832744a718ab8db45466dfe
 +        final long maskedSections,
 +        final long @Nullable [] @Nullable [] visibleCells,
 +        final long maskedBiomes,
-+        final io.canvasmc.canvas.anticheat.antibud.AntiBud.@Nullable ChunkDisguise buds
++        final io.canvasmc.canvas.anticheat.disguise.@Nullable ChunkRewrite disguises
 +    ) {
 +        // Canvas end - visibility anticheat - anti-freecam
          ChunkPos chunkPos = levelChunk.getPos();
@@ -420,16 +421,16 @@ index 1b83d541378c98e3517904973e3ea4e33098a914..7bc349174832744a718ab8db45466dfe
              chunkPos.z(),
 -            new ClientboundLevelChunkPacketData(levelChunk, chunkPacketInfo), // Paper - Anti-Xray
 -            new ClientboundLightUpdatePacketData(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter)
-+            new ClientboundLevelChunkPacketData(levelChunk, chunkPacketInfo, maskedSections, visibleCells, maskedBiomes, buds), // Paper - Anti-Xray // Canvas - visibility anticheat - anti-freecam, anti-bud
-+            io.canvasmc.canvas.anticheat.freecam.ChunkMasking.maskLight(io.canvasmc.canvas.anticheat.antibud.AntiBud.correctLight(new ClientboundLightUpdatePacketData(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter), buds), maskedSections, visibleCells) // Canvas - visibility anticheat - anti-freecam, anti-bud
++            new ClientboundLevelChunkPacketData(levelChunk, chunkPacketInfo, maskedSections, visibleCells, maskedBiomes, disguises), // Paper - Anti-Xray // Canvas - visibility anticheat - anti-freecam, disguises
++            io.canvasmc.canvas.anticheat.freecam.ChunkMasking.maskLight(io.canvasmc.canvas.anticheat.disguise.ChunkRewrite.correctLight(new ClientboundLightUpdatePacketData(chunkPos, lightEngine, skyChangedLightSectionFilter, blockChangedLightSectionFilter), disguises), maskedSections, visibleCells) // Canvas - visibility anticheat - anti-freecam, disguises
          );
          // Paper start - Anti-Xray - Modify blocks
          if (chunkPacketInfo != null) {
 diff --git a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..b83cccdad380ec2a3872ccc3546800aa9726cc24 100644
+index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..963d6f923070fe740ee4d41c9408942149fe6785 100644
 --- a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
 +++ b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-@@ -48,6 +48,71 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
+@@ -48,6 +48,73 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
          this.states = blockChanges.values().toArray(new BlockState[0]);
      }
      // Paper end - Multi Block Change API
@@ -441,25 +442,27 @@ index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..b83cccdad380ec2a3872ccc3546800aa
 +    }
 +
 +    /**
-+     * Whether any of the changes is to a state anti-bud may disguise, computed once per packet: 0 unknown, 1 no, 2 yes.
++     * Whether any of the changes is to a state anti-bud or storage hiding may disguise or hide, computed once per
++     * packet: 0 unknown, 1 no, 2 yes.
 +     */
-+    private byte canvas$buds;
++    private byte canvas$disguisable;
 +
 +    /**
 +     * @return this packet if the player may see every change as it is, a copy without the hidden changes and with
 +     * the buds anti-bud disguises from the player disguised, or {@code null} if all changes are hidden
 +     */
 +    public @org.jspecify.annotations.Nullable ClientboundSectionBlocksUpdatePacket canvas$filter(final io.canvasmc.canvas.anticheat.PlayerVisibility visibility) {
-+        if (this.canvas$buds == 0) {
-+            boolean buds = false;
++        if (this.canvas$disguisable == 0) {
++            boolean disguisable = false;
 +            for (final BlockState state : this.states) {
-+                buds |= io.canvasmc.canvas.anticheat.antibud.BudDisguise.isBud(state);
++                disguisable |= io.canvasmc.canvas.anticheat.antibud.BudDisguise.isBud(state) || io.canvasmc.canvas.anticheat.storage.StorageBlocks.mayBeStorage(state);
 +            }
-+            this.canvas$buds = (byte) (buds ? 2 : 1);
++            this.canvas$disguisable = (byte) (disguisable ? 2 : 1);
 +        }
-+        final boolean buds = this.canvas$buds == 2;
-+        final boolean mayHide = visibility.mayHideInSection(this.sectionPos.x(), this.sectionPos.y(), this.sectionPos.z());
-+        if (!mayHide && !buds) {
++        final boolean buds = this.canvas$disguisable == 2;
++        // storage placed out of sight is hidden even where nothing was hidden before
++        final boolean mayHide = buds || visibility.mayHideInSection(this.sectionPos.x(), this.sectionPos.y(), this.sectionPos.z());
++        if (!mayHide) {
 +            return this;
 +        }
 +        final int minX = this.sectionPos.minBlockX();
@@ -565,11 +568,22 @@ index ff67684ce3dd298d076859d5ec8f724dc07276b1..c406d87fbcd4596e6c0132b2eb8920bf
                      if (this.seenBy.add(player.connection)) {
                          // Paper start - entity tracking events
 diff --git a/net/minecraft/server/level/ServerEntity.java b/net/minecraft/server/level/ServerEntity.java
-index af741fa730b7364e8d50fa838b9e761549f7df11..2cd62118280ca21e05a4731a7fca7b68b3eaf0d5 100644
+index af741fa730b7364e8d50fa838b9e761549f7df11..f5b62f07bb31c5cddd7e64639f97191e5e28c8c9 100644
 --- a/net/minecraft/server/level/ServerEntity.java
 +++ b/net/minecraft/server/level/ServerEntity.java
-@@ -401,7 +401,7 @@ public class ServerEntity {
+@@ -380,6 +380,7 @@ public class ServerEntity {
+     public void removePairing(final ServerPlayer player) {
+         this.entity.stopSeenByPlayer(player);
+         player.connection.send(new ClientboundRemoveEntitiesPacket(this.entity.getId()));
++        player.canvas$visibility.onUnpaired(this.entity); // Canvas - visibility anticheat - invisible players
+     }
+ 
+     public void addPairing(final ServerPlayer player) {
+@@ -399,9 +400,10 @@ public class ServerEntity {
+         }
+ 
          Packet<ClientGamePacketListener> packet = this.entity.getAddEntityPacket(this);
++        packet = player.canvas$visibility.pairingPacket(this.entity, packet, broadcast); // Canvas - visibility anticheat - invisible players
          broadcast.accept(packet);
          if (this.trackedDataValues != null) {
 -            broadcast.accept(new ClientboundSetEntityDataPacket(this.entity.getId(), this.trackedDataValues));
@@ -577,7 +591,7 @@ index af741fa730b7364e8d50fa838b9e761549f7df11..2cd62118280ca21e05a4731a7fca7b68
          }
  
          if (this.entity instanceof LivingEntity livingEntity) {
-@@ -470,6 +470,14 @@ public class ServerEntity {
+@@ -470,6 +472,14 @@ public class ServerEntity {
          List<SynchedEntityData.DataValue<?>> packedValues = entityData.packDirty();
          if (packedValues != null) {
              this.trackedDataValues = entityData.getNonDefaultValues();
@@ -593,7 +607,7 @@ index af741fa730b7364e8d50fa838b9e761549f7df11..2cd62118280ca21e05a4731a7fca7b68
          }
  
 diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-index 63db562fe485987a66a91d20d5f81d8549a8f991..02569b1b3540df2220f858621745bab871952fea 100644
+index 63db562fe485987a66a91d20d5f81d8549a8f991..1f38e6eb667f738222627b9b1ec676d86e37c9d7 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
 @@ -1884,6 +1884,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
@@ -608,20 +622,28 @@ index 63db562fe485987a66a91d20d5f81d8549a8f991..02569b1b3540df2220f858621745bab8
                      player.connection.send(new ClientboundBlockDestructionPacket(id, blockPos, progress));
                  }
              }
-@@ -1964,6 +1969,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -1964,17 +1969,9 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
  
      @Override
      public void levelEvent(final @Nullable Entity source, final @LevelEvent.Value int type, final BlockPos pos, final int data) {
-+        // Canvas start - visibility anticheat - disguise the broken state of hidden blocks
-+        if (type == LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK || type == LevelEvent.PARTICLES_DESTROY_BLOCK) {
-+            io.canvasmc.canvas.anticheat.VisibilityFilters.broadcastBlockBreakEvent(this, source instanceof Player player ? player : null, type, pos, data);
-+            return;
-+        }
+-        this.server
+-            .getPlayerList()
+-            .broadcast(
+-                source instanceof Player player ? player : null,
+-                pos.getX(),
+-                pos.getY(),
+-                pos.getZ(),
+-                64.0, // Paper - diff on change (the 64.0 distance is used as defaults for sound ranges in spigot config for ender dragon, end portal and wither)
+-                this.dimension(),
+-                new ClientboundLevelEventPacket(type, pos, data, false)
+-            );
++        // Canvas start - visibility anticheat - no particles in places players can't see, disguise the broken state of hidden blocks
++        io.canvasmc.canvas.anticheat.VisibilityFilters.broadcastLevelEvent(this, source instanceof Player player ? player : null, type, pos, data);
 +        // Canvas end - visibility anticheat
-         this.server
-             .getPlayerList()
-             .broadcast(
-@@ -2000,6 +2011,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     }
+ 
+     public int getLogicalHeight() {
+@@ -2000,6 +1997,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          }
  
          this.getChunkSource().blockChanged(pos);
@@ -633,7 +655,26 @@ index 63db562fe485987a66a91d20d5f81d8549a8f991..02569b1b3540df2220f858621745bab8
          regionizedWorldData.pathTypesByPosCache.invalidate(pos); // Folia - region threading
          if (this.paperConfig().misc.updatePathfindingOnBlockUpdate) { // Paper - option to disable pathfinding updates
          VoxelShape oldShape = old.getCollisionShape(this, pos);
-@@ -2200,17 +2216,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -2169,12 +2171,16 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         for (ServerPlayer player : this.getLocalPlayers()) { // Folia - region thraeding
+             if (player.distanceToSqr(center) < 4096.0) {
+                 Optional<Vec3> playerKnockback = Optional.ofNullable(explosion.getHitPlayers().get(player));
+-                player.connection
+-                    .send(
++                // Canvas start - visibility anticheat - only the sound of explosions in places the player can't see
++                final net.minecraft.network.protocol.Packet<?> explosionPacket = io.canvasmc.canvas.anticheat.VisibilityFilters.explosionFor(player,
+                         new ClientboundExplodePacket(
+                             center, r, blockCount, playerKnockback, explosionParticle, explosionSound, blockParticles, source == null || !source.isSilent()
+                         )
+                     );
++                if (explosionPacket != null) {
++                    player.connection.send(explosionPacket);
++                }
++                // Canvas end - visibility anticheat
+             }
+         }
+ 
+@@ -2200,17 +2206,11 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          // Folia end - region threading
              if (this.shouldTickBlocksAt(eventData.pos())) {
                  if (this.doBlockEvent(eventData)) {
@@ -656,6 +697,15 @@ index 63db562fe485987a66a91d20d5f81d8549a8f991..02569b1b3540df2220f858621745bab8
                  }
              } else {
                  blockEventsToReschedule.add(eventData); // Folia - region threading
+@@ -2606,6 +2606,8 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     ) {
+         if (player.level() != this) {
+             return false;
++        } else if (player.canvas$visibility.hidesParticlesAt(Mth.floor(x), Mth.floor(y), Mth.floor(z))) { // Canvas - visibility anticheat - no particles in places the player can't see
++            return false;
+         } else {
+             BlockPos pos = player.blockPosition();
+             if (pos.closerToCenterThan(new Vec3(x, y, z), overrideLimiter ? 512.0 : 32.0)) {
 diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
 index dbb1b7c78a2e4cd62e1e9f4d54d0209a1c0b88a0..42842741df042eab87497f96ab8c1d2ba2e8da99 100644
 --- a/net/minecraft/server/level/ServerPlayer.java
@@ -735,7 +785,7 @@ index 196c01fe5f200ed57e6f23e0939cac616305571a..a0f573b298724ccba1fc806df50ee570
          // Paper start - PlayerChunkLoadEvent
          if (io.papermc.paper.event.packet.PlayerChunkLoadEvent.getHandlerList().getRegisteredListeners().length > 0) {
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index 8adc35cc39e0580b938c6331fc5c2d5b85aee5fd..64e21bd4bc7057ad6a1167fc3b7e3b8b09bcf584 100644
+index 8adc35cc39e0580b938c6331fc5c2d5b85aee5fd..c826ee61c77e524237e75cdd75865ffe11cfafbb 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 @@ -1130,7 +1130,13 @@ public class ServerGamePacketListenerImpl
@@ -777,7 +827,21 @@ index 8adc35cc39e0580b938c6331fc5c2d5b85aee5fd..64e21bd4bc7057ad6a1167fc3b7e3b8b
          this.send(ClientboundPlayerPositionPacket.of(this.awaitingTeleport, destination, relatives));
      }
  
-@@ -2372,8 +2386,10 @@ public class ServerGamePacketListenerImpl
+@@ -2229,6 +2243,13 @@ public class ServerGamePacketListenerImpl
+                         return;
+                     }
+                     // Paper end - Don't allow digging into unloaded chunks
++                    // Canvas start - visibility anticheat - a client that had the invisible player in front of the block would have hit them
++                    if (action == ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK && this.player.canvas$visibility.interceptsDestroy()) {
++                        this.player.connection.ackBlockChangesUpTo(packet.getSequence());
++                        this.send(io.canvasmc.canvas.anticheat.VisibilityFilters.blockUpdateFor(this.player, this.player.level(), pos));
++                        return;
++                    }
++                    // Canvas end - visibility anticheat
+                     // Paper start - Send block entities after destroy prediction
+                     this.player.gameMode.capturedBlockEntity = false;
+                     this.player.gameMode.captureSentBlockEntities = true;
+@@ -2372,8 +2393,10 @@ public class ServerGamePacketListenerImpl
                                  // this.player.sendBuildLimitMessage(true, maxY); // Paper - Fix MC-306582: Fix build limit message being sent when it shouldn't be
                              }
  
@@ -790,6 +854,14 @@ index 8adc35cc39e0580b938c6331fc5c2d5b85aee5fd..64e21bd4bc7057ad6a1167fc3b7e3b8b
                          }
                          if (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.updateEquipmentOnPlayerActions) this.player.detectEquipmentUpdates(); // Paper - Force update attributes.
                          // Paper - Remove unused warning
+@@ -2882,6 +2905,7 @@ public class ServerGamePacketListenerImpl
+         PacketUtils.ensureRunningOnSameThread(packet, this, this.player.level());
+         if (this.player.isImmobile()) return; // CraftBukkit
+         this.player.resetLastActionTime();
++        this.player.canvas$visibility.onMissedSwing(); // Canvas - visibility anticheat - hits on invisible players the client doesn't have
+         // CraftBukkit start - Raytrace to look for 'rogue armswings'
+         Location origin = CraftLocation.toBukkit(this.player.getEyePosition(), this.player.level(), this.player.getYRot(), this.player.getXRot());
+         double maxRange = Math.max(this.player.blockInteractionRange(), this.player.entityInteractionRange()); // todo flawed
 diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
 index 2a19cf8a3ca35bcb1a7cab901ca90361441cf78f..35bce8471a8d3190f4a35fe5b14d483effadd0c1 100644
 --- a/net/minecraft/world/entity/Entity.java

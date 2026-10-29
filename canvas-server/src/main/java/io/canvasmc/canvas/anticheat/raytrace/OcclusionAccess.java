@@ -2,6 +2,7 @@ package io.canvasmc.canvas.anticheat.raytrace;
 
 import ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable;
 import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
+import java.util.function.Predicate;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -31,6 +32,7 @@ public final class OcclusionAccess implements BlockOcclusion {
     private final int maxY;
     private final int minSectionY;
     private boolean lavaObscures;
+    private @Nullable Predicate<BlockState> alsoOccluding;
 
     private long cachedChunkKey = Long.MIN_VALUE;
     private LevelChunkSection @Nullable [] cachedSections;
@@ -52,6 +54,14 @@ public final class OcclusionAccess implements BlockOcclusion {
      */
     public void setLavaObscures(final boolean lavaObscures) {
         this.lavaObscures = lavaObscures;
+    }
+
+    /**
+     * Blocks that count as occluding besides full opaque cubes, like storage tracing storage: a chest hides what is
+     * behind it. Tested for blocks that aren't air or opaque only.
+     */
+    public void setAlsoOccluding(final @Nullable Predicate<BlockState> alsoOccluding) {
+        this.alsoOccluding = alsoOccluding;
     }
 
     /**
@@ -83,7 +93,14 @@ public final class OcclusionAccess implements BlockOcclusion {
             return true;
         }
         final BlockState state = readState(sections[(y >> 4) - this.minSectionY], x, y, z);
-        return state != null && (state.isSolidRender() || (this.lavaObscures && state == LAVA_SOURCE));
+        if (state == null) {
+            return false;
+        }
+        if (state.isSolidRender() || (this.lavaObscures && state == LAVA_SOURCE)) {
+            return true;
+        }
+        final Predicate<BlockState> alsoOccluding = this.alsoOccluding;
+        return alsoOccluding != null && !state.isAir() && alsoOccluding.test(state);
     }
 
     /**

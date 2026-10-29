@@ -1,4 +1,4 @@
-package io.canvasmc.canvas.anticheat.antibud;
+package io.canvasmc.canvas.anticheat.disguise;
 
 import it.unimi.dsi.fastutil.longs.Long2ByteMap;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
@@ -6,15 +6,15 @@ import java.util.Arrays;
 
 /**
  * Computes the block light the light engine would have computed if some light sources emitted less, starting from
- * the light it did compute. This is how disguised buds get the light of the small bud they are disguised as, so the
- * light around them doesn't give away their size.
+ * the light it did compute. This is how blocks sent disguised get the light of what they are disguised as: buds get
+ * the light of a small bud, hidden storage the light of the block it is sent as, so light doesn't give them away.
  * <p>
  * Mirrors Starlight's propagation exactly: each lowered source is set to its new emission and the light it may have
  * provided is removed (light decrease), then everything around the removed area, and every source inside it, is
  * propagated again (light increase). The result is the unique fixpoint the light engine computes, so it doesn't depend
  * on the order of the sources. The work stays within the reach of the lowered sources' light.
  */
-public final class BudLight {
+public final class LoweredLight {
 
     /**
      * The world the light is computed in. Directions are {@code -x, +x, -y, +y, -z, +z}, so the opposite of
@@ -57,7 +57,7 @@ public final class BudLight {
     private int[] increase = new int[INCREASE_STRIDE * 64];
     private int increaseLength;
 
-    public BudLight(final Medium medium) {
+    public LoweredLight(final Medium medium) {
         this.medium = medium;
         this.changed.defaultReturnValue((byte) -1);
     }

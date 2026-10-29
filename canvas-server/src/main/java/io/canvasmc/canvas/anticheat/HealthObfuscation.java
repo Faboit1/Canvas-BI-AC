@@ -22,7 +22,7 @@ public final class HealthObfuscation {
      * @return whether entity data of this entity must be sanitized before it's sent to other players
      */
     public static boolean appliesTo(final Entity entity) {
-        return entity instanceof ServerPlayer player && player.level().canvasConfig().anticheat.obfuscatePlayerHealth;
+        return entity instanceof ServerPlayer player && player.level().canvasConfig().anticheat.effective().obfuscatePlayerHealth;
     }
 
     /**

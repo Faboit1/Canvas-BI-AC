@@ -9,9 +9,9 @@ import io.canvasmc.canvas.anticheat.CameraSnapshot;
 import io.canvasmc.canvas.anticheat.PlayerVisibility;
 import io.canvasmc.canvas.anticheat.VisibilityModule;
 import io.canvasmc.canvas.anticheat.raytrace.BlockOcclusion;
+import io.canvasmc.canvas.anticheat.raytrace.FaceVisibility;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionCache;
-import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
 import io.papermc.paper.antixray.ChunkPacketInfo;
 import io.papermc.paper.antixray.ChunkPacketInfoAntiXray;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -77,20 +77,6 @@ public final class RayTraceAntiXray implements VisibilityModule {
      * the block itself and the client turning a little ahead of the server.
      */
     private static final double FRUSTUM_MARGIN = 1.0;
-    /**
-     * Face samples are moved this far into the block, so rays start in the block's own cell, which isn't tested.
-     */
-    private static final double FACE_INSET = 1.0 / 1024.0;
-    /**
-     * Distance of the corner samples from the edges of a face.
-     */
-    private static final double CORNER_INSET = 1.0 / 16.0;
-    private static final double[] CORNERS = {
-        CORNER_INSET, CORNER_INSET,
-        CORNER_INSET, 1.0 - CORNER_INSET,
-        1.0 - CORNER_INSET, CORNER_INSET,
-        1.0 - CORNER_INSET, 1.0 - CORNER_INSET
-    };
 
     private final PlayerVisibility owner;
     private final ConcurrentChainedLong2ReferenceHashTable<TrackedChunk> chunks = new ConcurrentChainedLong2ReferenceHashTable<>();
@@ -568,10 +554,8 @@ public final class RayTraceAntiXray implements VisibilityModule {
     }
 
     /**
-     * Whether any point of an exposed face of the block that faces the camera can be seen from it. Each such face
-     * is sampled at its center and close to its corners, centers first since they decide most blocks. Rays start at
-     * the block and end at the camera: hidden blocks sit in caves, so rays usually leave the block's surroundings
-     * through a wall within a few cells.
+     * Whether the block is in front of the camera, if the view direction matters, and can be seen from it, see
+     * {@link FaceVisibility}.
      */
     private boolean isVisibleFrom(final BlockOcclusion access, final int x, final int y, final int z,
                                   final double camX, final double camY, final double camZ,
@@ -580,46 +564,7 @@ public final class RayTraceAntiXray implements VisibilityModule {
             return false;
         }
 
-        final int faceX = camX < x ? -1 : (camX > x + 1 ? 1 : 0);
-        final int faceY = camY < y ? -1 : (camY > y + 1 ? 1 : 0);
-        final int faceZ = camZ < z ? -1 : (camZ > z + 1 ? 1 : 0);
-        if ((faceX | faceY | faceZ) == 0) {
-            // the camera is inside the block
-            return true;
-        }
-        // a face is only visible if the block in front of it doesn't cover it
-        final boolean exposedX = faceX != 0 && !access.isOpaque(x + faceX, y, z);
-        final boolean exposedY = faceY != 0 && !access.isOpaque(x, y + faceY, z);
-        final boolean exposedZ = faceZ != 0 && !access.isOpaque(x, y, z + faceZ);
-        if (!exposedX && !exposedY && !exposedZ) {
-            return false;
-        }
-
-        final double planeX = faceX < 0 ? x + FACE_INSET : x + 1.0 - FACE_INSET;
-        final double planeY = faceY < 0 ? y + FACE_INSET : y + 1.0 - FACE_INSET;
-        final double planeZ = faceZ < 0 ? z + FACE_INSET : z + 1.0 - FACE_INSET;
-        if (exposedX && isClear(access, planeX, y + 0.5, z + 0.5, camX, camY, camZ)
-            || exposedY && isClear(access, x + 0.5, planeY, z + 0.5, camX, camY, camZ)
-            || exposedZ && isClear(access, x + 0.5, y + 0.5, planeZ, camX, camY, camZ)) {
-            return true;
-        }
-        for (int i = 0; i < CORNERS.length; i += 2) {
-            final double u = CORNERS[i];
-            final double v = CORNERS[i + 1];
-            if (exposedX && isClear(access, planeX, y + u, z + v, camX, camY, camZ)
-                || exposedY && isClear(access, x + u, planeY, z + v, camX, camY, camZ)
-                || exposedZ && isClear(access, x + u, y + v, planeZ, camX, camY, camZ)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean isClear(final BlockOcclusion access, final double x, final double y, final double z,
-                                   final double camX, final double camY, final double camZ) {
-        // the block itself doesn't occlude, but the camera's cell does: a client whose camera is inside an opaque
-        // block only renders that block, and glitching the head into a wall must not reveal what's behind it
-        return VoxelRaycaster.isClear(access, x, y, z, camX, camY, camZ, false, true);
+        return FaceVisibility.isVisibleFrom(access, x, y, z, camX, camY, camZ);
     }
 
     private void addResult(final TrackedChunk tracked, final int index) {
@@ -730,6 +675,10 @@ public final class RayTraceAntiXray implements VisibilityModule {
     }
 
     private void sendRealState(final LevelChunk chunk, final BlockPos pos) {
+        if (this.owner.storage.isHiddenAt(pos.getX(), pos.getY(), pos.getZ())) {
+            // storage hiding reveals it once it is in sight, anti-xray no longer hides it then
+            return;
+        }
         final BlockState state = chunk.getBlockState(pos);
         this.owner.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.owner.disguiseBlock(pos.getX(), pos.getY(), pos.getZ(), state)));
         if (state.hasBlockEntity()) {

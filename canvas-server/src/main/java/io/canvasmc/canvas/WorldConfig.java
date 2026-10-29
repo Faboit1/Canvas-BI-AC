@@ -592,16 +592,49 @@ public class WorldConfig extends Part {
                 ).blank()
                 .wordWrap(
                     "Bypass permissions: \"canvas.anticheat.bypass.antixray\", \"canvas.anticheat.bypass.antiesp\",",
-                    "\"canvas.anticheat.bypass.antifreecam\", \"canvas.anticheat.bypass.undergroundviewdistance\" and",
-                    "\"canvas.anticheat.bypass.antibud\", or \"canvas.anticheat.bypass\" for all of them. They are not granted",
-                    "to operators by default.",
-                    "Spectators always bypass anti-esp and anti-freecam"
+                    "\"canvas.anticheat.bypass.antifreecam\", \"canvas.anticheat.bypass.undergroundviewdistance\",",
+                    "\"canvas.anticheat.bypass.antibud\", \"canvas.anticheat.bypass.antistorageesp\" and",
+                    "\"canvas.anticheat.bypass.invisibleplayers\", or \"canvas.anticheat.bypass\" for all of them. They",
+                    "are not granted to operators by default. Spectators always bypass anti-esp, anti-freecam, storage",
+                    "hiding and the hiding of invisible players"
                 )
             );
     }
 
     public Anticheat anticheat = new Anticheat();
     public static class Anticheat extends Part {
+
+        {
+            option("preset")
+                .docs(
+                    Style.wrap(
+                        "Sets every other anticheat option at once, from the cheapest setting that still protects to",
+                        "the strongest one, except the block and entity lists, which keep their configured values. With",
+                        "\"custom\" the other options are used as they are configured. Ray traced anti-xray (high and up)",
+                        "needs Paper anti-xray with \"engine-mode: 1\" in the paper world configuration"
+                    ).defineEnum(Preset.class, (preset) -> switch (preset) {
+                        case CUSTOM -> "The other options, as configured";
+                        case LOW -> "Storage hiding (32 blocks), invisible players, anti-bud, health obfuscation and the underground view distance";
+                        case MEDIUM -> "Low, plus section anti-freecam and anti-ESP, storage traced to 48 blocks";
+                        case HIGH -> "Per-block anti-freecam, ray traced anti-xray, third person cameras, storage to 64 blocks";
+                        case EXTRA -> "High, traced farther and more often: storage and ores to 80 blocks, entities to 128";
+                        case MAX -> "Extra, traced farther still and every other tick, hidden ores hidden again out of sight";
+                        case ULTRA -> "Everything traced every tick without limits, the most protection for the most CPU";
+                    })
+                );
+        }
+
+        public Preset preset = Preset.CUSTOM;
+        public enum Preset {
+            CUSTOM, LOW, MEDIUM, HIGH, EXTRA, MAX, ULTRA
+        }
+
+        /**
+         * @return these options, or the options of the configured preset
+         */
+        public Anticheat effective() {
+            return this.preset == Preset.CUSTOM ? this : io.canvasmc.canvas.anticheat.AnticheatPresets.apply(this);
+        }
 
         {
             option("rayTraceAntiXray")
@@ -763,8 +796,9 @@ public class WorldConfig extends Part {
                     Style.wrap(
                         "Anti-freecam. The server runs the same section occlusion graph the vanilla client uses for",
                         "culling, from the player's real position, and only sends the real contents of chunk sections the",
-                        "player could possibly see. All other sections are sent as solid stone (and without light, block",
-                        "entities or block updates), so moving the camera away from the body through walls reveals nothing.",
+                        "player could possibly see. All other sections are sent as filler (see \"filler\", and without light,",
+                        "block entities, block updates or particles), so moving the camera away from the body through walls",
+                        "reveals nothing.",
                         "Because the server's graph is always a superset of what the client renders, legit players never see",
                         "the hidden sections. Sections at or above the surface of a chunk are always sent, they are open to",
                         "the sky anyway, so only what lies underground is protected"
@@ -793,7 +827,7 @@ public class WorldConfig extends Part {
                     .docs(
                         Style.wrap(
                             "Masks single blocks instead of whole 16x16x16 sections: every block that no line of sight from the",
-                            "player's possible camera positions can reach is sent as stone, caves, rooms and ores right next to",
+                            "player's possible camera positions can reach is sent as filler, caves, rooms and ores right next to",
                             "the player included, unless they are open to the sky. Updates of blocks that can't be seen right now",
                             "are withheld until they can. Costs more worker CPU (a few milliseconds per update at view distance",
                             "10) and re-sends chunks more often when players dig into or walk through caves"
@@ -806,6 +840,30 @@ public class WorldConfig extends Part {
             public int maxResendsPerTick = 8;
             public int updateIntervalTicks = 10;
             public boolean perBlock = false;
+
+            {
+                option("filler")
+                    .docs(
+                        Style.wrap(
+                            "What the blocks the player can't see are sent as. The client needs a block everywhere, a chunk can't",
+                            "have holes. Paper's anti-xray counts the filler as solid either way, so ores next to it stay hidden"
+                        ).defineEnum(Filler.class, (filler) -> switch (filler) {
+                            case AIR -> "Empty space: nothing at all is drawn there, not even a shape. Clients draw the far side of the walls around what they see";
+                            case STONE -> "Stone, or deepslate, netherrack and end stone: solid rock like the surroundings";
+                        })
+                    );
+                option("hideParticles")
+                    .docs(
+                        "Particles in places the player can't see aren't sent: block breaking, explosions, potions, smoke,",
+                        "sculk vibrations and every other particle. Their sounds still are"
+                    );
+            }
+
+            public Filler filler = Filler.AIR;
+            public enum Filler {
+                AIR, STONE
+            }
+            public boolean hideParticles = true;
         }
 
         {
@@ -872,6 +930,91 @@ public class WorldConfig extends Part {
 
             public boolean enabled = false;
             public double revealDistance = 16.0D;
+        }
+
+        {
+            option("antiStorageEsp")
+                .docs(
+                    Style.wrap(
+                        "Storage hiding: chests, barrels, shulker boxes, ender chests, hoppers, furnaces and other storage",
+                        "that isn't open to the sky is only sent once the player can see it. Until then it is sent as the",
+                        "space or wall around it, without its block entity, its light, its updates or its animations,",
+                        "so stash finders (x-ray, storage ESP, freecam) get nothing of bases the player hasn't seen.",
+                        "Lines of sight are traced on the anticheat worker threads, without limits on height or the",
+                        "amount of storage per chunk, and independently of Paper anti-xray. Chests, shulker boxes and",
+                        "other box shaped storage hide what is behind them, like opaque blocks do"
+                    )
+                );
+        }
+
+        {
+            option("invisiblePlayers")
+                .docs(
+                    Style.wrap(
+                        "Invisible players. Vanilla sends them like any other player, so ESP mods draw them and name tag",
+                        "mods tell who they are. With this enabled, an invisible player nothing of which is drawn (no armor,",
+                        "no held item, not burning, glowing or riding) isn't sent to other players at all, only the particles",
+                        "of their effects are. Swings at them are hit detected on the server: a swing that would have hit",
+                        "them, hits them. An invisible player something of which is drawn is sent under a random name and",
+                        "without skin. Teammates who see invisible teammates and spectators get the real player. To hide",
+                        "how worn their armor is and what it is enchanted with too, turn on Paper's item obfuscation",
+                        "(anticheat.obfuscation.items.enable-item-obfuscation in paper-global.yml)"
+                    )
+                );
+        }
+
+        public InvisiblePlayers invisiblePlayers = new InvisiblePlayers();
+        public static class InvisiblePlayers extends Part {
+
+            {
+                option("enabled").docs("Whether invisible players are hidden in this world");
+                option("anonymize").docs("Whether invisible players with armor, held items or other visible parts are sent under a random name");
+            }
+
+            public boolean enabled = false;
+            public boolean anonymize = true;
+        }
+
+        public AntiStorageEsp antiStorageEsp = new AntiStorageEsp();
+        public static class AntiStorageEsp extends Part {
+
+            {
+                option("enabled").docs("Whether storage hiding is enabled in this world");
+                option("blocks")
+                    .docs(
+                        "Blocks that are hidden, for example \"minecraft:barrel\" or a tag like \"#minecraft:shulker_boxes\".",
+                        "If empty, all blocks that store items: chests (copper chests included), trapped chests, ender",
+                        "chests, barrels, shulker boxes, hoppers, dispensers, droppers, crafters, furnaces, smokers, blast",
+                        "furnaces, brewing stands, chiseled bookshelves, shelves and decorated pots"
+                    );
+                option("rayTraceDistance")
+                    .docs(
+                        "Hidden storage further than this many blocks from the player's eyes isn't traced and stays",
+                        "hidden until the player gets closer"
+                    ).greaterThan(0.0F);
+                option("rayTraceThirdPerson").docs("Also trace from the third person front and back camera positions, so players using F5 don't see storage pop in");
+                option("alwaysVisibleDistance").docs("Storage within this many blocks of the player's eyes is always sent").greaterThanOrEqualTo(0.0F);
+                option("maxTracedBlocksPerTick")
+                    .docs(
+                        "Maximum amount of hidden storage blocks traced per player and tick, nearest first. Storage",
+                        "covered on all sides facing the player costs nothing and doesn't count. Bounds the cost in huge",
+                        "storage rooms, the rest is traced in the following ticks, what waited longest first"
+                    ).greaterThan(0.0F);
+                option("updateIntervalTicks")
+                    .docs(
+                        "How often, in ticks, all hidden storage in range is traced again. In between, storage within 16",
+                        "blocks is traced whenever the player moves, and everything once the player moved 2 blocks or",
+                        "stopped somewhere new"
+                    ).greaterThan(0.0F);
+            }
+
+            public boolean enabled = false;
+            public List<String> blocks = new ArrayList<>();
+            public double rayTraceDistance = 64.0D;
+            public boolean rayTraceThirdPerson = true;
+            public double alwaysVisibleDistance = 3.0D;
+            public int maxTracedBlocksPerTick = 2048;
+            public int updateIntervalTicks = 10;
         }
     }
 
