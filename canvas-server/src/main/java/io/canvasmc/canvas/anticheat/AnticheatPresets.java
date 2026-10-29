@@ -8,8 +8,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>
  * The levels add protection in this order: storage hiding, invisible players, anti-bud, health obfuscation and the
  * underground view distance first, since they are cheap and protect bases; then anti-ESP and section anti-freecam;
- * then per-block anti-freecam and ray traced anti-xray. The top levels trace farther, more often and with higher
- * limits. Every level hides storage, so no level gives away bases.
+ * then per-block anti-freecam and ray traced anti-xray; then anti-freecam by line of sight. The top levels trace
+ * farther, more often and with higher limits. Every level hides storage, so no level gives away bases. No level
+ * hides revealed blocks again, which would make them pop in late with a high ping.
  */
 public final class AnticheatPresets {
 
@@ -74,6 +75,10 @@ public final class AnticheatPresets {
         freecam.updateIntervalTicks = level.pick(20, 20, 10, 5, 2, 1);
         freecam.maxResendsPerTick = level.pick(4, 4, 8, 12, 16, 32);
         freecam.hideParticles = true;
+        freecam.lineOfSight = level.atLeast(Level.MAX);
+        // two blocks cover a sprinting player's movement over a 150 ms round trip
+        freecam.lineOfSightMargin = 2.0;
+        freecam.lineOfSightDistance = level.pick(64, 64, 64, 64, 64, 128);
 
         final WorldConfig.Anticheat.AntiEsp esp = ret.antiEsp;
         esp.enabled = level.atLeast(Level.MEDIUM);
@@ -90,11 +95,13 @@ public final class AnticheatPresets {
         xray.enabled = level.atLeast(Level.HIGH);
         xray.rayTraceDistance = level.pick(64, 64, 64, 80, 96, 128);
         xray.rayTraceThirdPerson = level.atLeast(Level.EXTRA);
-        xray.frustumCulling = true;
+        // what is revealed stays, turning or walking past a pillar never makes ores pop in late
+        xray.frustumCulling = false;
         xray.maxRayTraceBlockCountPerChunk = level.pick(100, 100, 100, 200, 400, 1000);
-        xray.rehideBlocks = level.atLeast(Level.MAX);
-        xray.rehideDistance = level.atLeast(Level.MAX) ? 64.0 : Double.POSITIVE_INFINITY;
+        xray.rehideBlocks = false;
+        xray.rehideDistance = Double.POSITIVE_INFINITY;
         xray.updateIntervalTicks = level.pick(10, 10, 10, 5, 2, 1);
+        xray.revealMargin = level.pick(1, 1, 1, 2, 2, 2);
         return ret;
     }
 
