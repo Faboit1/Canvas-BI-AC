@@ -1,5 +1,7 @@
 package io.canvasmc.canvas.anticheat.freecam;
 
+import io.canvasmc.canvas.anticheat.raytrace.BlockOcclusion;
+import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
 import java.util.Arrays;
 import org.jspecify.annotations.Nullable;
 
@@ -28,9 +30,65 @@ import org.jspecify.annotations.Nullable;
  * shifts per long (Kogge-Stone), so a section converges after a handful of passes no matter how large its caves
  * are. Sections whose blocks are all reachable, like the open sky, are flagged instead of stored.
  * <p>
+ * <b>Line of sight</b> ({@link Sight}) narrows the result down to what straight lines from a few camera points really
+ * reach, see {@link #restrictToSight}: the flood only bounds where to look.
+ * <p>
  * Instances hold reusable working memory and are not thread safe.
  */
-public final class CellVisibility {
+public final class CellVisibility implements BlockOcclusion {
+
+    /**
+     * The camera points of line of sight mode and how far from the first one lines are traced.
+     */
+    public static final class Sight {
+        public static final int MAX_CAMERAS = 32;
+        /**
+         * Camera points closer than this to one already added see next to the same, they are left out.
+         */
+        private static final double MIN_SPACING_SQUARED = 0.5 * 0.5;
+
+        /**
+         * Camera points as {@code x, y, z} triples. The first one is the eyes.
+         */
+        public final double[] cameras = new double[3 * MAX_CAMERAS];
+        public int cameraCount;
+        /**
+         * Blocks farther than this from the first camera aren't traced, they keep what the flood reached.
+         */
+        public double maxDistanceSquared = Double.POSITIVE_INFINITY;
+
+        public void clear() {
+            this.cameraCount = 0;
+        }
+
+        /**
+         * Adds a camera point, unless there are {@link #MAX_CAMERAS} already.
+         */
+        public void add(final double x, final double y, final double z) {
+            if (this.cameraCount == MAX_CAMERAS) {
+                return;
+            }
+            for (int i = 0; i < this.cameraCount * 3; i += 3) {
+                final double dx = this.cameras[i] - x;
+                final double dy = this.cameras[i + 1] - y;
+                final double dz = this.cameras[i + 2] - z;
+                if (dx * dx + dy * dy + dz * dz < MIN_SPACING_SQUARED) {
+                    return;
+                }
+            }
+            final int i = this.cameraCount++ * 3;
+            this.cameras[i] = x;
+            this.cameras[i + 1] = y;
+            this.cameras[i + 2] = z;
+        }
+    }
+
+    /**
+     * Where line of sight tests a face from the first camera: its center first, then a grid over it, inset a little
+     * so the end point lies inside the face. Other cameras only test the center.
+     */
+    private static final double[] FACE_SAMPLES = {0.5, 0.5, 0.05, 0.05, 0.95, 0.05, 0.05, 0.95, 0.95, 0.95,
+        0.5, 0.05, 0.5, 0.95, 0.05, 0.5, 0.95, 0.5};
 
     /**
      * Supplies the sections of the grid.
@@ -141,8 +199,18 @@ public final class CellVisibility {
     private long[] stageA = new long[64 * WORDS];
     private long[] stageB = new long[64 * WORDS];
     private long[] visible = new long[64 * WORDS];
+    /**
+     * Per slot, the blocks open to the sky.
+     */
+    private long[] open = new long[64 * WORDS];
     private int neighborBase;
     private final long[] layerSky = new long[WORDS];
+
+    // line of sight
+    private @Nullable Sight sight;
+    private long[] cellQueue = new long[1024];
+    private int lastOpacityNode = -1;
+    private long @Nullable [] lastOpacity;
 
     /**
      * Computes the visible blocks. The results are read with {@link #kind} and {@link #copyVisible} until the next
@@ -162,10 +230,12 @@ public final class CellVisibility {
      * @param near        a box (block coordinates) in which the blocks touching visible blocks are visible as
      *                    well, or {@code null}: blocks the player may break must not have filler behind them, the
      *                    client shows what is behind a block before the server confirms it was broken
+     * @param sight       line of sight mode, or {@code null}
      */
     public void compute(final Sections sections, final int width, final int depth, final int height,
                         final int originX, final int originZ, final int minSectionY, final long[] domain,
-                        final boolean sky, final int[] cameras, final int cameraCount, final int[] box, final int @Nullable [] near) {
+                        final boolean sky, final int[] cameras, final int cameraCount, final int[] box, final int @Nullable [] near,
+                        final @Nullable Sight sight) {
         this.sections = sections;
         this.domain = domain;
         this.width = width;
@@ -191,6 +261,8 @@ public final class CellVisibility {
             Arrays.fill(this.state, 0, nodes, NONE);
         }
         this.slots = 0;
+        this.lastOpacityNode = -1;
+        this.lastOpacity = null;
 
         int queued = 0;
         if (sky) {
@@ -200,6 +272,9 @@ public final class CellVisibility {
             queued = this.seedCamera(cameras[i * 3], cameras[i * 3 + 1], cameras[i * 3 + 2], queued);
         }
         this.flood(queued);
+        if (sight != null) {
+            this.restrictToSight(sight);
+        }
         this.dilate();
         if (near != null) {
             this.dilateNear(near);
@@ -212,6 +287,8 @@ public final class CellVisibility {
     public void release() {
         this.sections = NO_SECTIONS;
         Arrays.fill(this.opacity, null);
+        this.lastOpacity = null;
+        this.sight = null;
     }
 
     // results
@@ -282,8 +359,10 @@ public final class CellVisibility {
             this.stageA = Arrays.copyOf(this.stageA, index * 2 * WORDS);
             this.stageB = Arrays.copyOf(this.stageB, index * 2 * WORDS);
             this.visible = Arrays.copyOf(this.visible, index * 2 * WORDS);
+            this.open = Arrays.copyOf(this.open, index * 2 * WORDS);
         }
         final int base = index * WORDS;
+        Arrays.fill(this.open, base, base + WORDS, 0L);
         Arrays.fill(this.reach, base, base + WORDS, 0L);
         Arrays.fill(this.stageA, base, base + WORDS, 0L);
         Arrays.fill(this.stageB, base, base + WORDS, 0L);
@@ -384,6 +463,7 @@ public final class CellVisibility {
                 if (any != 0L) {
                     final int base = this.store(node) * WORDS;
                     System.arraycopy(sky, 0, this.reach, base, WORDS);
+                    System.arraycopy(sky, 0, this.open, base, WORDS);
                     queued = this.enqueue(node, queued);
                 }
             }
@@ -672,6 +752,389 @@ public final class CellVisibility {
                 }
             }
         }
+    }
+
+    // line of sight
+
+    /**
+     * Narrows the reachable blocks down to the see-through blocks that a straight line from a camera point reaches.
+     * <p>
+     * Such a line enters each block it passes through by one of its faces, coming from the block before it, which
+     * the line reached too. So the blocks it reaches are found by a search from the cameras: a block is entered from
+     * a reached neighbor only if a line from a camera reaches the face between them, tested with a few points on
+     * the face ({@link #FACE_SAMPLES}). Blocks open to the sky are public and stay reachable without a test, the
+     * blocks next to them are entered from them the same way. Only blocks the flood reached can be visible (it
+     * covers every straight line from the camera box), so only those are entered, and blocks farther than
+     * {@link Sight#maxDistanceSquared} keep what the flood found.
+     */
+    private void restrictToSight(final Sight sight) {
+        this.sight = sight;
+        final long[] seen = this.stageA;
+        Arrays.fill(seen, 0, this.slots * WORDS, 0L);
+        int queued = 0;
+        // the blocks of the cameras themselves
+        for (int i = 0; i < sight.cameraCount; ++i) {
+            final int x = (int) Math.floor(sight.cameras[i * 3]);
+            final int y = (int) Math.floor(sight.cameras[i * 3 + 1]);
+            final int z = (int) Math.floor(sight.cameras[i * 3 + 2]);
+            final int base = this.storedBase(x, y, z);
+            if (base >= 0) {
+                final int bit = bitOf(x, y, z);
+                seen[base + (bit >>> 6)] |= 1L << bit;
+            }
+            queued = this.queueCell(x, y, z, queued);
+        }
+        queued = this.seedNextToOpen(seen, queued);
+        this.spread(seen, queued);
+        if (sight.maxDistanceSquared != Double.POSITIVE_INFINITY) {
+            this.keepFar(seen, sight);
+        }
+        final long[] reach = this.reach;
+        final long[] open = this.open;
+        for (int i = 0, words = this.slots * WORDS; i < words; ++i) {
+            reach[i] = open[i] | seen[i];
+        }
+    }
+
+    /**
+     * Enters the reachable blocks next to blocks open to the sky from them.
+     */
+    private int seedNextToOpen(final long[] seen, int queued) {
+        final Sight sight = this.sight;
+        final long[] next = this.stageB;
+        for (int i = 0, slots = this.slots; i < slots; ++i) {
+            final int base = i * WORDS;
+            this.faceNeighbors(i, this.open, next);
+            final int node = this.slotNode[i];
+            final int column = node / this.height;
+            final int blockX = (this.originX + column % this.width) << 4;
+            final int blockY = (this.minSectionY + node % this.height) << 4;
+            final int blockZ = (this.originZ + column / this.width) << 4;
+            for (int w = 0; w < WORDS; ++w) {
+                for (long bits = next[base + w] & this.reach[base + w] & ~this.open[base + w]; bits != 0L; bits &= bits - 1L) {
+                    final int bit = w << 6 | Long.numberOfTrailingZeros(bits);
+                    final int x = blockX | bit & 15;
+                    final int y = blockY | bit >>> 8;
+                    final int z = blockZ | (bit >>> 4) & 15;
+                    if (!this.withinTraceDistance(sight, x, y, z)) {
+                        continue;
+                    }
+                    for (int direction = 0; direction < 6; ++direction) {
+                        // from the open neighbor towards this block
+                        final int fromX = x - stepX(direction);
+                        final int fromY = y - stepY(direction);
+                        final int fromZ = z - stepZ(direction);
+                        if (this.isOpen(fromX, fromY, fromZ) && this.faceVisible(fromX, fromY, fromZ, direction)) {
+                            seen[base + w] |= 1L << bit;
+                            queued = this.queueCell(x, y, z, queued);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return queued;
+    }
+
+    /**
+     * Searches outwards from the queued blocks, entering every reachable neighbor whose shared face a camera sees.
+     */
+    private void spread(final long[] seen, int queued) {
+        final Sight sight = this.sight;
+        final int gridX = this.originX << 4;
+        final int gridY = this.minSectionY << 4;
+        final int gridZ = this.originZ << 4;
+        int head = 0;
+        while (head < queued) {
+            final long cell = this.cellQueue[head++];
+            final int x = gridX + (int) (cell & 0xFFFFL);
+            final int z = gridZ + (int) (cell >>> 16 & 0xFFFFL);
+            final int y = gridY + (int) (cell >>> 32);
+            if (queued + 6 > this.cellQueue.length) {
+                System.arraycopy(this.cellQueue, head, this.cellQueue, 0, queued - head);
+                queued -= head;
+                head = 0;
+                if (queued + 6 > this.cellQueue.length) {
+                    this.cellQueue = Arrays.copyOf(this.cellQueue, this.cellQueue.length * 2);
+                }
+            }
+            for (int direction = 0; direction < 6; ++direction) {
+                final int nx = x + stepX(direction);
+                final int ny = y + stepY(direction);
+                final int nz = z + stepZ(direction);
+                final int base = this.storedBase(nx, ny, nz);
+                if (base < 0) {
+                    continue;
+                }
+                final int bit = bitOf(nx, ny, nz);
+                final int word = base + (bit >>> 6);
+                final long mask = 1L << bit;
+                if ((this.reach[word] & ~this.open[word] & ~seen[word] & mask) == 0L
+                    || !this.withinTraceDistance(sight, nx, ny, nz) || !this.faceVisible(x, y, z, direction)) {
+                    continue;
+                }
+                seen[word] |= mask;
+                queued = this.queueCell(nx, ny, nz, queued);
+            }
+        }
+    }
+
+    /**
+     * Blocks beyond the trace distance keep what the flood reached.
+     */
+    private void keepFar(final long[] seen, final Sight sight) {
+        final double eyeX = sight.cameras[0];
+        final double eyeY = sight.cameras[1];
+        final double eyeZ = sight.cameras[2];
+        final double max = sight.maxDistanceSquared;
+        for (int i = 0, slots = this.slots; i < slots; ++i) {
+            final int node = this.slotNode[i];
+            final int column = node / this.height;
+            final int blockX = (this.originX + column % this.width) << 4;
+            final int blockY = (this.minSectionY + node % this.height) << 4;
+            final int blockZ = (this.originZ + column / this.width) << 4;
+            final double nearX = Math.max(0.0, Math.max(blockX - eyeX, eyeX - (blockX + 16)));
+            final double nearY = Math.max(0.0, Math.max(blockY - eyeY, eyeY - (blockY + 16)));
+            final double nearZ = Math.max(0.0, Math.max(blockZ - eyeZ, eyeZ - (blockZ + 16)));
+            if (nearX * nearX + nearY * nearY + nearZ * nearZ > max) {
+                final int base = i * WORDS;
+                for (int w = 0; w < WORDS; ++w) {
+                    seen[base + w] |= this.reach[base + w];
+                }
+                continue;
+            }
+            final double farX = Math.max(Math.abs(blockX - eyeX), Math.abs(blockX + 16 - eyeX));
+            final double farY = Math.max(Math.abs(blockY - eyeY), Math.abs(blockY + 16 - eyeY));
+            final double farZ = Math.max(Math.abs(blockZ - eyeZ), Math.abs(blockZ + 16 - eyeZ));
+            if (farX * farX + farY * farY + farZ * farZ <= max) {
+                continue;
+            }
+            final int base = i * WORDS;
+            for (int w = 0; w < WORDS; ++w) {
+                for (long bits = this.reach[base + w] & ~seen[base + w]; bits != 0L; bits &= bits - 1L) {
+                    final int bit = w << 6 | Long.numberOfTrailingZeros(bits);
+                    if (!this.withinTraceDistance(sight, blockX | bit & 15, blockY | bit >>> 8, blockZ | (bit >>> 4) & 15)) {
+                        seen[base + w] |= 1L << bit;
+                    }
+                }
+            }
+        }
+    }
+
+    private boolean withinTraceDistance(final Sight sight, final int x, final int y, final int z) {
+        final double dx = x + 0.5 - sight.cameras[0];
+        final double dy = y + 0.5 - sight.cameras[1];
+        final double dz = z + 0.5 - sight.cameras[2];
+        return dx * dx + dy * dy + dz * dz <= sight.maxDistanceSquared;
+    }
+
+    /**
+     * Whether a straight line from a camera reaches the face of the block in the given direction, coming through
+     * the block. Cameras on the other side of the face can't.
+     */
+    private boolean faceVisible(final int x, final int y, final int z, final int direction) {
+        final Sight sight = this.sight;
+        final double[] cameras = sight.cameras;
+        // the face: its plane on the axis of the direction, spanned by the two other axes
+        final int axis = axisOf(direction);
+        final boolean positive = stepX(direction) + stepY(direction) + stepZ(direction) > 0;
+        final double plane = (axis == 0 ? x : axis == 1 ? y : z) + (positive ? 1 : 0);
+        final int samples = FACE_SAMPLES.length / 2;
+        for (int sample = 0; sample < samples; ++sample) {
+            final double u = FACE_SAMPLES[sample * 2];
+            final double v = FACE_SAMPLES[sample * 2 + 1];
+            final double px;
+            final double py;
+            final double pz;
+            switch (axis) {
+                case 0 -> {
+                    px = plane;
+                    py = y + u;
+                    pz = z + v;
+                }
+                case 1 -> {
+                    px = x + u;
+                    py = plane;
+                    pz = z + v;
+                }
+                default -> {
+                    px = x + u;
+                    py = y + v;
+                    pz = plane;
+                }
+            }
+            // every camera tests the center, only the first one the rest
+            for (int camera = 0, count = sample == 0 ? sight.cameraCount : 1; camera < count; ++camera) {
+                final double cx = cameras[camera * 3];
+                final double cy = cameras[camera * 3 + 1];
+                final double cz = cameras[camera * 3 + 2];
+                final double side = axis == 0 ? cx : axis == 1 ? cy : cz;
+                if (positive ? side >= plane : side <= plane) {
+                    continue;
+                }
+                if (VoxelRaycaster.isClear(this, cx, cy, cz, px, py, pz, false, false)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether a block of the grid renders as a full opaque cube. Blocks outside the grid or in missing columns
+     * don't, the client has nothing there.
+     */
+    @Override
+    public boolean isOpaque(final int x, final int y, final int z) {
+        final int node = this.nodeAt(x, y, z);
+        if (node < 0) {
+            return false;
+        }
+        long[] opaque = this.lastOpacity;
+        if (node != this.lastOpacityNode || opaque == null) {
+            opaque = this.lastOpacity = this.opacityOf(node);
+            this.lastOpacityNode = node;
+        }
+        final int bit = bitOf(x, y, z);
+        return (opaque[bit >>> 6] >>> bit & 1L) != 0L;
+    }
+
+    /**
+     * @return the section of the grid holding the block, or -1 if it lies outside the grid or in a missing column
+     */
+    private int nodeAt(final int x, final int y, final int z) {
+        final int columnX = (x >> 4) - this.originX;
+        final int columnZ = (z >> 4) - this.originZ;
+        final int index = (y >> 4) - this.minSectionY;
+        if (columnX < 0 || columnX >= this.width || columnZ < 0 || columnZ >= this.depth || index < 0 || index >= this.height) {
+            return -1;
+        }
+        final int column = columnZ * this.width + columnX;
+        return this.sections.hasColumn(column) ? column * this.height + index : -1;
+    }
+
+    /**
+     * @return the base of the block's section in the slot arrays, or -1 if it has no slot
+     */
+    private int storedBase(final int x, final int y, final int z) {
+        final int node = this.nodeAt(x, y, z);
+        return node < 0 || (this.state[node] & STORED) == 0 ? -1 : this.slot[node] * WORDS;
+    }
+
+    private boolean isOpen(final int x, final int y, final int z) {
+        final int node = this.nodeAt(x, y, z);
+        if (node < 0) {
+            return false;
+        }
+        final byte state = this.state[node];
+        if ((state & FULL) != 0) {
+            return true;
+        }
+        if ((state & STORED) == 0) {
+            return false;
+        }
+        final int bit = bitOf(x, y, z);
+        return (this.open[this.slot[node] * WORDS + (bit >>> 6)] >>> bit & 1L) != 0L;
+    }
+
+    private int queueCell(final int x, final int y, final int z, final int queued) {
+        final int rx = x - (this.originX << 4);
+        final int ry = y - (this.minSectionY << 4);
+        final int rz = z - (this.originZ << 4);
+        if (rx < 0 || rx >= this.width << 4 || rz < 0 || rz >= this.depth << 4 || ry < 0 || ry >= this.height << 4) {
+            return queued;
+        }
+        if (queued == this.cellQueue.length) {
+            this.cellQueue = Arrays.copyOf(this.cellQueue, queued * 2);
+        }
+        this.cellQueue[queued] = rx | (long) rz << 16 | (long) ry << 32;
+        return queued + 1;
+    }
+
+    /**
+     * The blocks sharing a face with the given blocks of a section, from its neighbors too.
+     */
+    private void faceNeighbors(final int slot, final long[] from, final long[] to) {
+        final int node = this.slotNode[slot];
+        final int base = slot * WORDS;
+        for (int w = 0; w < WORDS; ++w) {
+            final long b = from[base + w];
+            long n = ((b << 1) & ~X0) | ((b >>> 1) & ~X15) | (b << 16) | (b >>> 16);
+            final int k = w & 3;
+            if (k != 0) {
+                n |= from[base + w - 1] >>> 48;
+            }
+            if (k != 3) {
+                n |= from[base + w + 1] << 48;
+            }
+            if (w >= 4) {
+                n |= from[base + w - 4];
+            }
+            if (w < 60) {
+                n |= from[base + w + 4];
+            }
+            to[base + w] = n;
+        }
+        final long[] west = this.neighborStage(node, SectionVisibility.WEST, from);
+        if (west != null) {
+            for (int w = 0; w < WORDS; ++w) {
+                to[base + w] |= (west[this.neighborBase + w] & X15) >>> 15;
+            }
+        }
+        final long[] east = this.neighborStage(node, SectionVisibility.EAST, from);
+        if (east != null) {
+            for (int w = 0; w < WORDS; ++w) {
+                to[base + w] |= (east[this.neighborBase + w] & X0) << 15;
+            }
+        }
+        final long[] north = this.neighborStage(node, SectionVisibility.NORTH, from);
+        if (north != null) {
+            for (int y = 0; y < 16; ++y) {
+                to[base + (y << 2)] |= north[this.neighborBase + (y << 2) + 3] >>> 48;
+            }
+        }
+        final long[] south = this.neighborStage(node, SectionVisibility.SOUTH, from);
+        if (south != null) {
+            for (int y = 0; y < 16; ++y) {
+                to[base + (y << 2) + 3] |= south[this.neighborBase + (y << 2)] << 48;
+            }
+        }
+        final long[] below = this.neighborStage(node, SectionVisibility.DOWN, from);
+        if (below != null) {
+            for (int k = 0; k < 4; ++k) {
+                to[base + k] |= below[this.neighborBase + 60 + k];
+            }
+        }
+        final long[] above = this.neighborStage(node, SectionVisibility.UP, from);
+        if (above != null) {
+            for (int k = 0; k < 4; ++k) {
+                to[base + 60 + k] |= above[this.neighborBase + k];
+            }
+        }
+    }
+
+    private static int bitOf(final int x, final int y, final int z) {
+        return (x & 15) | (z & 15) << 4 | (y & 15) << 8;
+    }
+
+    private static int axisOf(final int direction) {
+        return switch (direction) {
+            case SectionVisibility.WEST, SectionVisibility.EAST -> 0;
+            case SectionVisibility.DOWN, SectionVisibility.UP -> 1;
+            default -> 2;
+        };
+    }
+
+    private static int stepX(final int direction) {
+        return direction == SectionVisibility.WEST ? -1 : direction == SectionVisibility.EAST ? 1 : 0;
+    }
+
+    private static int stepY(final int direction) {
+        return direction == SectionVisibility.DOWN ? -1 : direction == SectionVisibility.UP ? 1 : 0;
+    }
+
+    private static int stepZ(final int direction) {
+        return direction == SectionVisibility.NORTH ? -1 : direction == SectionVisibility.SOUTH ? 1 : 0;
     }
 
     // visible blocks
