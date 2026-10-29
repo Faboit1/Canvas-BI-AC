@@ -121,6 +121,12 @@ public final class FreecamGuard implements VisibilityModule {
      * Line of sight: how far, in blocks, the eyes move before what they see is computed again.
      */
     private static final double SIGHT_MOVE = 1.0;
+    /**
+     * Line of sight: a player that stopped this far from where the last result was computed gets one for where it
+     * stands. The points around the eyes only sample the margin, a player standing still between them must still
+     * get everything it sees.
+     */
+    private static final double SIGHT_STOP_MOVE = 0.05;
 
     /**
      * Line of sight: the directions in which third person cameras are sampled, whichever way the player looks: a
@@ -875,7 +881,10 @@ public final class FreecamGuard implements VisibilityModule {
             final double dx = snapshot.eyeX - last[0];
             final double dy = snapshot.eyeY - last[1];
             final double dz = snapshot.eyeZ - last[2];
-            boxChanged = dx * dx + dy * dy + dz * dz > SIGHT_MOVE * SIGHT_MOVE;
+            final double moved = dx * dx + dy * dy + dz * dz;
+            final boolean stopped = snapshot.velocityX * snapshot.velocityX + snapshot.velocityY * snapshot.velocityY
+                + snapshot.velocityZ * snapshot.velocityZ < 1.0E-4;
+            boxChanged = moved > SIGHT_MOVE * SIGHT_MOVE || stopped && moved > SIGHT_STOP_MOVE * SIGHT_STOP_MOVE;
         }
         final boolean urgent = this.urgentCheck;
         final int sinceLastJob = snapshot.tick - this.lastJobTick;
@@ -908,20 +917,24 @@ public final class FreecamGuard implements VisibilityModule {
         this.jobPrevious = this.current;
         this.jobResult = result;
         System.arraycopy(this.box, 0, this.jobBox, 0, 6);
-        System.arraycopy(this.box, 0, this.lastJobBox, 0, 6);
         System.arraycopy(this.blockBox, 0, this.jobBlockBox, 0, 6);
-        System.arraycopy(this.blockBox, 0, this.lastJobBlockBox, 0, 6);
         System.arraycopy(this.digBox, 0, this.jobDigBox, 0, 6);
+        if (!this.jobCheckOnly) {
+            // what the next job is compared with: a check only keeps the result of where it was computed, so moving
+            // the reference along with checks would never compute a new one for a player moving a little every tick
+            System.arraycopy(this.box, 0, this.lastJobBox, 0, 6);
+            System.arraycopy(this.blockBox, 0, this.lastJobBlockBox, 0, 6);
+            final double[] last = this.lastJobSight;
+            last[0] = snapshot.eyeX;
+            last[1] = snapshot.eyeY;
+            last[2] = snapshot.eyeZ;
+        }
         this.jobLineOfSight = this.lineOfSight;
         this.jobSightMargin = config.lineOfSightMargin;
         this.jobSightDistance = config.lineOfSightDistance;
         this.jobAheadX = this.aheadX;
         this.jobAheadY = this.aheadY;
         this.jobAheadZ = this.aheadZ;
-        final double[] last = this.lastJobSight;
-        last[0] = snapshot.eyeX;
-        last[1] = snapshot.eyeY;
-        last[2] = snapshot.eyeZ;
         this.jobScheduled = true;
         this.chunksChanged = false;
         this.lastJobTick = snapshot.tick;
