@@ -78,7 +78,7 @@ public final class AnticheatPresets {
         freecam.lineOfSight = level.atLeast(Level.MAX);
         // two blocks cover a sprinting player's movement over a 150 ms round trip
         freecam.lineOfSightMargin = 2.0;
-        freecam.lineOfSightDistance = level.pick(96, 96, 96, 96, 96, 192);
+        freecam.lineOfSightDistance = level.pick(64, 64, 64, 64, 64, 128);
 
         final WorldConfig.Anticheat.AntiEsp esp = ret.antiEsp;
         esp.enabled = level.atLeast(Level.MEDIUM);

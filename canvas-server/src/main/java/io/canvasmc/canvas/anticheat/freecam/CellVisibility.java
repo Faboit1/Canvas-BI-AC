@@ -1,6 +1,5 @@
 package io.canvasmc.canvas.anticheat.freecam;
 
-import io.canvasmc.canvas.anticheat.raytrace.BlockOcclusion;
 import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
 import java.util.Arrays;
 import org.jspecify.annotations.Nullable;
@@ -35,7 +34,7 @@ import org.jspecify.annotations.Nullable;
  * <p>
  * Instances hold reusable working memory and are not thread safe.
  */
-public final class CellVisibility implements BlockOcclusion {
+public final class CellVisibility {
 
     /**
      * The camera points of line of sight mode and how far from the first one lines are traced.
@@ -53,12 +52,27 @@ public final class CellVisibility implements BlockOcclusion {
         public final double[] cameras = new double[3 * MAX_CAMERAS];
         public int cameraCount;
         /**
+         * How many of the first cameras faces farther than {@link #GRID_DISTANCE_SQUARED} are tested from, see
+         * {@link #primaryDone}.
+         */
+        int primaryCount = MAX_CAMERAS;
+        /**
          * Blocks farther than this from the first camera aren't traced, they keep what the flood reached.
          */
         public double maxDistanceSquared = Double.POSITIVE_INFINITY;
 
         public void clear() {
             this.cameraCount = 0;
+            this.primaryCount = MAX_CAMERAS;
+        }
+
+        /**
+         * Marks the cameras added so far as the ones faces far away are tested from. The ones added afterwards stand
+         * for where the cameras may get to soon: from far away they see about the same, and the lines of sight they
+         * get through nearby faces are followed far anyway.
+         */
+        public void primaryDone() {
+            this.primaryCount = this.cameraCount;
         }
 
         /**
@@ -85,10 +99,12 @@ public final class CellVisibility implements BlockOcclusion {
 
     /**
      * Where line of sight tests a face from the first camera: its center first, then a grid over it, inset a little
-     * so the end point lies inside the face. Other cameras only test the center.
+     * so the end point lies inside the face. Other cameras, and faces farther than {@link #GRID_DISTANCE_SQUARED},
+     * only test the center: the blocks touching a visible block are sent too, which covers the rest.
      */
     private static final double[] FACE_SAMPLES = {0.5, 0.5, 0.05, 0.05, 0.95, 0.05, 0.05, 0.95, 0.95, 0.95,
         0.5, 0.05, 0.5, 0.95, 0.05, 0.5, 0.95, 0.5};
+    private static final double GRID_DISTANCE_SQUARED = 32.0 * 32.0;
 
     /**
      * Supplies the sections of the grid.
@@ -209,8 +225,9 @@ public final class CellVisibility implements BlockOcclusion {
     // line of sight
     private @Nullable Sight sight;
     private long[] cellQueue = new long[1024];
-    private int lastOpacityNode = -1;
-    private long @Nullable [] lastOpacity;
+    private int cellHead;
+    private int cellTail;
+    private long[] seen = new long[0];
 
     /**
      * Computes the visible blocks. The results are read with {@link #kind} and {@link #copyVisible} until the next
@@ -261,8 +278,6 @@ public final class CellVisibility implements BlockOcclusion {
             Arrays.fill(this.state, 0, nodes, NONE);
         }
         this.slots = 0;
-        this.lastOpacityNode = -1;
-        this.lastOpacity = null;
 
         int queued = 0;
         if (sky) {
@@ -287,7 +302,6 @@ public final class CellVisibility implements BlockOcclusion {
     public void release() {
         this.sections = NO_SECTIONS;
         Arrays.fill(this.opacity, null);
-        this.lastOpacity = null;
         this.sight = null;
     }
 
@@ -769,9 +783,10 @@ public final class CellVisibility implements BlockOcclusion {
      */
     private void restrictToSight(final Sight sight) {
         this.sight = sight;
-        final long[] seen = this.stageA;
+        final long[] seen = this.seen = this.stageA;
         Arrays.fill(seen, 0, this.slots * WORDS, 0L);
-        int queued = 0;
+        this.cellHead = 0;
+        this.cellTail = 0;
         // the blocks of the cameras themselves
         for (int i = 0; i < sight.cameraCount; ++i) {
             final int x = (int) Math.floor(sight.cameras[i * 3]);
@@ -782,10 +797,10 @@ public final class CellVisibility implements BlockOcclusion {
                 final int bit = bitOf(x, y, z);
                 seen[base + (bit >>> 6)] |= 1L << bit;
             }
-            queued = this.queueCell(x, y, z, queued);
+            this.queueCell(x, y, z);
         }
-        queued = this.seedNextToOpen(seen, queued);
-        this.spread(seen, queued);
+        this.seedNextToOpen();
+        this.spread();
         if (sight.maxDistanceSquared != Double.POSITIVE_INFINITY) {
             this.keepFar(seen, sight);
         }
@@ -799,8 +814,9 @@ public final class CellVisibility implements BlockOcclusion {
     /**
      * Enters the reachable blocks next to blocks open to the sky from them.
      */
-    private int seedNextToOpen(final long[] seen, int queued) {
+    private void seedNextToOpen() {
         final Sight sight = this.sight;
+        final long[] seen = this.seen;
         final long[] next = this.stageB;
         for (int i = 0, slots = this.slots; i < slots; ++i) {
             final int base = i * WORDS;
@@ -813,6 +829,10 @@ public final class CellVisibility implements BlockOcclusion {
             for (int w = 0; w < WORDS; ++w) {
                 for (long bits = next[base + w] & this.reach[base + w] & ~this.open[base + w]; bits != 0L; bits &= bits - 1L) {
                     final int bit = w << 6 | Long.numberOfTrailingZeros(bits);
+                    if ((seen[base + w] >>> bit & 1L) != 0L) {
+                        // an extended line of sight got there already
+                        continue;
+                    }
                     final int x = blockX | bit & 15;
                     final int y = blockY | bit >>> 8;
                     final int z = blockZ | (bit >>> 4) & 15;
@@ -826,38 +846,29 @@ public final class CellVisibility implements BlockOcclusion {
                         final int fromZ = z - stepZ(direction);
                         if (this.isOpen(fromX, fromY, fromZ) && this.faceVisible(fromX, fromY, fromZ, direction)) {
                             seen[base + w] |= 1L << bit;
-                            queued = this.queueCell(x, y, z, queued);
+                            this.queueCell(x, y, z);
                             break;
                         }
                     }
                 }
             }
         }
-        return queued;
     }
 
     /**
      * Searches outwards from the queued blocks, entering every reachable neighbor whose shared face a camera sees.
      */
-    private void spread(final long[] seen, int queued) {
+    private void spread() {
         final Sight sight = this.sight;
+        final long[] seen = this.seen;
         final int gridX = this.originX << 4;
         final int gridY = this.minSectionY << 4;
         final int gridZ = this.originZ << 4;
-        int head = 0;
-        while (head < queued) {
-            final long cell = this.cellQueue[head++];
+        while (this.cellHead < this.cellTail) {
+            final long cell = this.cellQueue[this.cellHead++];
             final int x = gridX + (int) (cell & 0xFFFFL);
             final int z = gridZ + (int) (cell >>> 16 & 0xFFFFL);
             final int y = gridY + (int) (cell >>> 32);
-            if (queued + 6 > this.cellQueue.length) {
-                System.arraycopy(this.cellQueue, head, this.cellQueue, 0, queued - head);
-                queued -= head;
-                head = 0;
-                if (queued + 6 > this.cellQueue.length) {
-                    this.cellQueue = Arrays.copyOf(this.cellQueue, this.cellQueue.length * 2);
-                }
-            }
             for (int direction = 0; direction < 6; ++direction) {
                 final int nx = x + stepX(direction);
                 final int ny = y + stepY(direction);
@@ -874,7 +885,85 @@ public final class CellVisibility implements BlockOcclusion {
                     continue;
                 }
                 seen[word] |= mask;
-                queued = this.queueCell(nx, ny, nz, queued);
+                this.queueCell(nx, ny, nz);
+            }
+        }
+    }
+
+    /**
+     * Follows a line of sight from a camera on past the point a test found it reaching, marking every reachable
+     * block it passes before it hits a block that renders as a full opaque cube: those are seen too. In open caves
+     * a handful of such lines reach most blocks, which then need no test of their own.
+     */
+    private void extend(final double camX, final double camY, final double camZ, final double pointX, final double pointY, final double pointZ) {
+        final double dx = pointX - camX;
+        final double dy = pointY - camY;
+        final double dz = pointZ - camZ;
+        final double length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (length < 1.0E-6) {
+            return;
+        }
+        final double maxT = Math.min(Math.sqrt(this.sight.maxDistanceSquared) + 2.0, 1024.0) / length;
+        // the block the line enters right after the point
+        int x = (int) Math.floor(pointX + dx * 1.0E-6);
+        int y = (int) Math.floor(pointY + dy * 1.0E-6);
+        int z = (int) Math.floor(pointZ + dz * 1.0E-6);
+        final int stepX = dx >= 0.0 ? 1 : -1;
+        final int stepY = dy >= 0.0 ? 1 : -1;
+        final int stepZ = dz >= 0.0 ? 1 : -1;
+        final double tDeltaX = dx == 0.0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dx);
+        final double tDeltaY = dy == 0.0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dy);
+        final double tDeltaZ = dz == 0.0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dz);
+        // t is measured along the camera to point segment, the point is at 1
+        double tMaxX = dx == 0.0 ? Double.POSITIVE_INFINITY : 1.0 + (stepX > 0 ? (x + 1.0 - pointX) : (pointX - x)) * tDeltaX;
+        double tMaxY = dy == 0.0 ? Double.POSITIVE_INFINITY : 1.0 + (stepY > 0 ? (y + 1.0 - pointY) : (pointY - y)) * tDeltaY;
+        double tMaxZ = dz == 0.0 ? Double.POSITIVE_INFINITY : 1.0 + (stepZ > 0 ? (z + 1.0 - pointZ) : (pointZ - z)) * tDeltaZ;
+        final long[] seen = this.seen;
+        int sectionX = Integer.MIN_VALUE;
+        int sectionY = 0;
+        int sectionZ = 0;
+        int node = -1;
+        long[] opaque = SectionVisibility.NOTHING_OPAQUE;
+        for (;;) {
+            if (x >> 4 != sectionX || y >> 4 != sectionY || z >> 4 != sectionZ) {
+                sectionX = x >> 4;
+                sectionY = y >> 4;
+                sectionZ = z >> 4;
+                node = this.nodeAt(x, y, z);
+                if (node < 0) {
+                    // left the grid or entered a missing column, nothing to mark beyond
+                    return;
+                }
+                opaque = this.opacityOf(node);
+            }
+            final int bit = (x & 15) | (z & 15) << 4 | (y & 15) << 8;
+            if ((opaque[bit >>> 6] >>> bit & 1L) != 0L) {
+                return;
+            }
+            if ((this.state[node] & STORED) != 0) {
+                final int word = this.slot[node] * WORDS + (bit >>> 6);
+                final long mask = 1L << bit;
+                if ((this.reach[word] & ~this.open[word] & ~seen[word] & mask) != 0L) {
+                    seen[word] |= mask;
+                    this.queueCell(x, y, z);
+                }
+            }
+            final double t;
+            if (tMaxX < tMaxY && tMaxX < tMaxZ) {
+                t = tMaxX;
+                x += stepX;
+                tMaxX += tDeltaX;
+            } else if (tMaxY < tMaxZ) {
+                t = tMaxY;
+                y += stepY;
+                tMaxY += tDeltaY;
+            } else {
+                t = tMaxZ;
+                z += stepZ;
+                tMaxZ += tDeltaZ;
+            }
+            if (t > maxT) {
+                return;
             }
         }
     }
@@ -939,7 +1028,12 @@ public final class CellVisibility implements BlockOcclusion {
         final int axis = axisOf(direction);
         final boolean positive = stepX(direction) + stepY(direction) + stepZ(direction) > 0;
         final double plane = (axis == 0 ? x : axis == 1 ? y : z) + (positive ? 1 : 0);
-        final int samples = FACE_SAMPLES.length / 2;
+        final double ex = x + 0.5 - cameras[0];
+        final double ey = y + 0.5 - cameras[1];
+        final double ez = z + 0.5 - cameras[2];
+        final boolean far = ex * ex + ey * ey + ez * ez > GRID_DISTANCE_SQUARED;
+        final int samples = far ? 1 : FACE_SAMPLES.length / 2;
+        final int cameraCount = far ? Math.min(sight.cameraCount, sight.primaryCount) : sight.cameraCount;
         for (int sample = 0; sample < samples; ++sample) {
             final double u = FACE_SAMPLES[sample * 2];
             final double v = FACE_SAMPLES[sample * 2 + 1];
@@ -964,7 +1058,7 @@ public final class CellVisibility implements BlockOcclusion {
                 }
             }
             // every camera tests the center, only the first one the rest
-            for (int camera = 0, count = sample == 0 ? sight.cameraCount : 1; camera < count; ++camera) {
+            for (int camera = 0, count = sample == 0 ? cameraCount : 1; camera < count; ++camera) {
                 final double cx = cameras[camera * 3];
                 final double cy = cameras[camera * 3 + 1];
                 final double cz = cameras[camera * 3 + 2];
@@ -972,7 +1066,8 @@ public final class CellVisibility implements BlockOcclusion {
                 if (positive ? side >= plane : side <= plane) {
                     continue;
                 }
-                if (VoxelRaycaster.isClear(this, cx, cy, cz, px, py, pz, false, false)) {
+                if (this.isClear(cx, cy, cz, px, py, pz)) {
+                    this.extend(cx, cy, cz, px, py, pz);
                     return true;
                 }
             }
@@ -981,22 +1076,68 @@ public final class CellVisibility implements BlockOcclusion {
     }
 
     /**
-     * Whether a block of the grid renders as a full opaque cube. Blocks outside the grid or in missing columns
-     * don't, the client has nothing there.
+     * Whether no block between the two points renders as a full opaque cube, not counting the blocks the points are
+     * in: {@link VoxelRaycaster#isClear}, reading the opacity of the grid one section at a time.
      */
-    @Override
-    public boolean isOpaque(final int x, final int y, final int z) {
-        final int node = this.nodeAt(x, y, z);
-        if (node < 0) {
-            return false;
+    private boolean isClear(final double x0, final double y0, final double z0, final double x1, final double y1, final double z1) {
+        int x = (int) Math.floor(x0);
+        int y = (int) Math.floor(y0);
+        int z = (int) Math.floor(z0);
+        int remainingX = Math.abs((int) Math.floor(x1) - x);
+        int remainingY = Math.abs((int) Math.floor(y1) - y);
+        int remainingZ = Math.abs((int) Math.floor(z1) - z);
+        int remaining = remainingX + remainingY + remainingZ;
+        if (remaining <= 1) {
+            return true;
         }
-        long[] opaque = this.lastOpacity;
-        if (node != this.lastOpacityNode || opaque == null) {
-            opaque = this.lastOpacity = this.opacityOf(node);
-            this.lastOpacityNode = node;
+        final double dx = x1 - x0;
+        final double dy = y1 - y0;
+        final double dz = z1 - z0;
+        final int stepX = dx >= 0.0 ? 1 : -1;
+        final int stepY = dy >= 0.0 ? 1 : -1;
+        final int stepZ = dz >= 0.0 ? 1 : -1;
+        final double tDeltaX = dx == 0.0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dx);
+        final double tDeltaY = dy == 0.0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dy);
+        final double tDeltaZ = dz == 0.0 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dz);
+        double tMaxX = dx == 0.0 ? Double.POSITIVE_INFINITY : (stepX > 0 ? (x + 1.0 - x0) : (x0 - x)) * tDeltaX;
+        double tMaxY = dy == 0.0 ? Double.POSITIVE_INFINITY : (stepY > 0 ? (y + 1.0 - y0) : (y0 - y)) * tDeltaY;
+        double tMaxZ = dz == 0.0 ? Double.POSITIVE_INFINITY : (stepZ > 0 ? (z + 1.0 - z0) : (z0 - z)) * tDeltaZ;
+        int sectionX = Integer.MIN_VALUE;
+        int sectionY = 0;
+        int sectionZ = 0;
+        long[] opaque = SectionVisibility.NOTHING_OPAQUE;
+        // the end block isn't tested
+        while (--remaining > 0) {
+            if (remainingX > 0 && (remainingY == 0 || tMaxX < tMaxY) && (remainingZ == 0 || tMaxX < tMaxZ)) {
+                x += stepX;
+                tMaxX += tDeltaX;
+                --remainingX;
+            } else if (remainingY > 0 && (remainingZ == 0 || tMaxY < tMaxZ)) {
+                y += stepY;
+                tMaxY += tDeltaY;
+                --remainingY;
+            } else if (remainingZ > 0) {
+                z += stepZ;
+                tMaxZ += tDeltaZ;
+                --remainingZ;
+            } else {
+                x += stepX;
+                tMaxX += tDeltaX;
+                --remainingX;
+            }
+            if (x >> 4 != sectionX || y >> 4 != sectionY || z >> 4 != sectionZ) {
+                sectionX = x >> 4;
+                sectionY = y >> 4;
+                sectionZ = z >> 4;
+                final int node = this.nodeAt(x, y, z);
+                opaque = node < 0 ? SectionVisibility.NOTHING_OPAQUE : this.opacityOf(node);
+            }
+            final int bit = (x & 15) | (z & 15) << 4 | (y & 15) << 8;
+            if ((opaque[bit >>> 6] >>> bit & 1L) != 0L) {
+                return false;
+            }
         }
-        final int bit = bitOf(x, y, z);
-        return (opaque[bit >>> 6] >>> bit & 1L) != 0L;
+        return true;
     }
 
     /**
@@ -1037,18 +1178,23 @@ public final class CellVisibility implements BlockOcclusion {
         return (this.open[this.slot[node] * WORDS + (bit >>> 6)] >>> bit & 1L) != 0L;
     }
 
-    private int queueCell(final int x, final int y, final int z, final int queued) {
+    private void queueCell(final int x, final int y, final int z) {
         final int rx = x - (this.originX << 4);
         final int ry = y - (this.minSectionY << 4);
         final int rz = z - (this.originZ << 4);
         if (rx < 0 || rx >= this.width << 4 || rz < 0 || rz >= this.depth << 4 || ry < 0 || ry >= this.height << 4) {
-            return queued;
+            return;
         }
-        if (queued == this.cellQueue.length) {
-            this.cellQueue = Arrays.copyOf(this.cellQueue, queued * 2);
+        if (this.cellTail == this.cellQueue.length) {
+            if (this.cellHead > this.cellQueue.length >> 1) {
+                System.arraycopy(this.cellQueue, this.cellHead, this.cellQueue, 0, this.cellTail - this.cellHead);
+                this.cellTail -= this.cellHead;
+                this.cellHead = 0;
+            } else {
+                this.cellQueue = Arrays.copyOf(this.cellQueue, this.cellQueue.length * 2);
+            }
         }
-        this.cellQueue[queued] = rx | (long) rz << 16 | (long) ry << 32;
-        return queued + 1;
+        this.cellQueue[this.cellTail++] = rx | (long) rz << 16 | (long) ry << 32;
     }
 
     /**

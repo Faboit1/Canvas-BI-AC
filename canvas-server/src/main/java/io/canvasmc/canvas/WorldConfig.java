@@ -618,8 +618,8 @@ public class WorldConfig extends Part {
                         case MEDIUM -> "Low, plus section anti-freecam and anti-ESP, storage traced to 48 blocks";
                         case HIGH -> "Per-block anti-freecam, ray traced anti-xray, third person cameras, storage to 64 blocks";
                         case EXTRA -> "High, traced farther and more often: storage and ores to 80 blocks, entities to 128";
-                        case MAX -> "Extra, traced farther still and every other tick, anti-freecam by line of sight to 96 blocks";
-                        case ULTRA -> "Everything traced every tick without limits, line of sight to 192 blocks, the most protection for the most CPU";
+                        case MAX -> "Extra, traced farther still and every other tick, anti-freecam by line of sight to 64 blocks";
+                        case ULTRA -> "Everything traced every tick without limits, line of sight to 128 blocks, the most protection for the most CPU";
                     })
                 );
         }
@@ -899,7 +899,7 @@ public class WorldConfig extends Part {
 
             public boolean lineOfSight = false;
             public double lineOfSightMargin = 1.0D;
-            public double lineOfSightDistance = 96.0D;
+            public double lineOfSightDistance = 64.0D;
         }
 
         {

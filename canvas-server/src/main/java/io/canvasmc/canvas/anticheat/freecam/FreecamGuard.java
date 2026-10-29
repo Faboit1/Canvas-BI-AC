@@ -1214,6 +1214,7 @@ public final class FreecamGuard implements VisibilityModule {
         if (ahead > 1.0E-3) {
             addClipped(sight, access, eyeX, eyeY, eyeZ, aheadX / ahead, aheadY / ahead, aheadZ / ahead, ahead);
         }
+        sight.primaryDone();
         final double[] around = CameraSnapshot.pointsAround(access, eyeX, eyeY, eyeZ, margin);
         for (int i = 0; i < around.length; i += 3) {
             sight.add(around[i], around[i + 1], around[i + 2]);
