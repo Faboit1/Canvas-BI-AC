@@ -577,6 +577,90 @@ public class GlobalConfiguration extends Part {
         public int workerThreads = -1;
     }
 
+    {
+        option("exploitProtection")
+            .docs(
+                "Limits on packets that modified clients send in floods or out of order, to lag the server through",
+                "plugin menus or to make plugin menus save outdated contents"
+            );
+    }
+
+    public ExploitProtection exploitProtection = new ExploitProtection();
+    public static class ExploitProtection extends Part {
+
+        {
+            option("containerClicks")
+                .docs(
+                    "Every player has a budget of inventory clicks, counted in clicks and in the time the server spends",
+                    "handling them, plugins included. A burst can use up to the max values at once and every tick gives",
+                    "back the per tick values. Clicks over the budget are dropped and the open menu is sent to the client",
+                    "again, so nothing is lost. A vanilla client stays far below: moving all items of a kind with a shift",
+                    "double-click sends at most 90 clicks at once"
+                );
+        }
+
+        public ContainerClicks containerClicks = new ContainerClicks();
+        public static class ContainerClicks extends Part {
+
+            {
+                option("enabled").docs("Whether inventory clicks are limited");
+                option("maxBurst").docs("Clicks a player can send at once").greaterThan(0.0F);
+                option("perTick").docs("Clicks given back every tick").greaterThan(0.0F);
+                option("maxBurstMillis").docs("Milliseconds of server time the clicks of a player can use at once").greaterThan(0.0F);
+                option("millisPerTick")
+                    .docs(
+                        "Milliseconds of server time given back every tick, so what the clicks of a player can use on",
+                        "average. A single click counts for at most max-burst-millis"
+                    ).greaterThan(0.0F);
+                option("kickAfterDropped")
+                    .docs("Dropped clicks and bundle selections within 5 seconds after which the player is kicked for spamming. 0 never kicks")
+                    .greaterThanOrEqualTo(0.0F);
+            }
+
+            public boolean enabled = true;
+            public int maxBurst = 256;
+            public int perTick = 32;
+            public double maxBurstMillis = 10.0;
+            public double millisPerTick = 2.0;
+            public int kickAfterDropped = 600;
+        }
+
+        {
+            option("bundleSelections")
+                .docs(
+                    "Budget of bundle item selections (scrolling over a bundle in an inventory) per player. Selections over",
+                    "the budget are dropped and the open menu is sent to the client again"
+                );
+        }
+
+        public BundleSelections bundleSelections = new BundleSelections();
+        public static class BundleSelections extends Part {
+
+            {
+                option("enabled").docs("Whether bundle item selections are limited");
+                option("maxBurst").docs("Selections a player can send at once").greaterThan(0.0F);
+                option("perTick").docs("Selections given back every tick").greaterThan(0.0F);
+            }
+
+            public boolean enabled = true;
+            public int maxBurst = 16;
+            public int perTick = 4;
+        }
+
+        {
+            option("closeDesyncedMenus")
+                .docs(
+                    "A vanilla client tells the server when it closes a menu before it sends anything else. When a client",
+                    "that already clicked in a menu sends a command, uses an item, interacts with a block or an entity,",
+                    "starts breaking a block, drops an item or swaps hands while the server still has that menu open, it",
+                    "closed the menu without telling the server. The server then closes the menu first, so plugins get",
+                    "their close event and save it before the packet is handled"
+                );
+        }
+
+        public boolean closeDesyncedMenus = true;
+    }
+
     public PurpurContainers purpurContainers = new PurpurContainers();
     public static class PurpurContainers extends Part {
 
