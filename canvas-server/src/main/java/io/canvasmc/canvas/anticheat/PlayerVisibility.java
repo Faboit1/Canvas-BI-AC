@@ -4,6 +4,7 @@ import io.canvasmc.canvas.WorldConfig;
 import io.canvasmc.canvas.anticheat.antibud.AntiBud;
 import io.canvasmc.canvas.anticheat.antiesp.EntityVisibility;
 import io.canvasmc.canvas.anticheat.antixray.RayTraceAntiXray;
+import io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation;
 import io.canvasmc.canvas.anticheat.disguise.BlockDisguises;
 import io.canvasmc.canvas.anticheat.freecam.ChunkMasking;
 import io.canvasmc.canvas.anticheat.freecam.FreecamGuard;
@@ -375,10 +376,14 @@ public final class PlayerVisibility {
      */
     public ClientboundLevelChunkWithLightPacket createChunkPacket(final LevelChunk chunk, final boolean modifyBlocks) {
         try {
+            // blocks ray traced anti-xray revealed stay real when the chunk is sent again
+            RayTraceObfuscation.keepReal(this.antiXray.revealedIn(chunk));
             return this.antiFreecam.createChunkPacket(chunk, modifyBlocks && !this.bypassesAntiXray(), this.disguises.prepareChunk(chunk));
         } catch (final RuntimeException thrown) {
             this.failed("createChunkPacket", thrown);
             return new ClientboundLevelChunkWithLightPacket(chunk, chunk.getLevel().getLightEngine(), null, null, modifyBlocks);
+        } finally {
+            RayTraceObfuscation.keepReal(null);
         }
     }
 
