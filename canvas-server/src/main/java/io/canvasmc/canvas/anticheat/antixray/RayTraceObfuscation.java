@@ -39,6 +39,10 @@ public final class RayTraceObfuscation {
     private static final int SECTION_BLOCKS = 16 * 16 * 16;
     private static final VarHandle LONGS = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.BIG_ENDIAN);
     private static final ThreadLocal<int[]> POSITIONS = ThreadLocal.withInitial(() -> new int[128]);
+    /**
+     * The positions the chunk packets created on this thread keep real, see {@link #keepReal}.
+     */
+    private static final ThreadLocal<int @Nullable []> KEEP_REAL = new ThreadLocal<>();
 
     /**
      * The configuration this was compiled from, compared by identity to notice reloads.
@@ -108,6 +112,27 @@ public final class RayTraceObfuscation {
     }
 
     /**
+     * Sets the traced blocks the chunk packets created on this thread from now on don't hide, because the player they
+     * are for got them real before: re-sending a chunk must not make revealed ores flicker back to stone.
+     *
+     * @param positions packed positions (see {@link #pack}) sorted ascending, or {@code null} for none
+     */
+    public static void keepReal(final int @Nullable [] positions) {
+        if (positions == null) {
+            KEEP_REAL.remove();
+        } else {
+            KEEP_REAL.set(positions);
+        }
+    }
+
+    /**
+     * @return the positions set by {@link #keepReal} on this thread, or {@code null}
+     */
+    public static int @Nullable [] keptReal() {
+        return KEEP_REAL.get();
+    }
+
+    /**
      * Hides the exposed traced blocks of an obfuscated chunk packet, records their positions on the info and strips
      * the block entities of all hidden blocks. Must be called after Paper's obfuscation and before the packet is
      * marked ready, which publishes the recorded positions to other threads.
@@ -122,6 +147,7 @@ public final class RayTraceObfuscation {
             POSITIONS.set(positions = new int[maxCount]);
         }
         int count = 0;
+        final int[] kept = info.getRayTraceKept();
         try {
             boolean[] paletteTrace = null;
             for (int sectionIndex = 0; sectionIndex <= maxChunkSectionIndex && count < maxCount; ++sectionIndex) {
@@ -149,7 +175,7 @@ public final class RayTraceObfuscation {
                 }
                 count = hideSection(
                     info.getBuffer(), info.getIndex(sectionIndex), info.getBits(sectionIndex), trace, hideId,
-                    (sectionIndex + minSectionY) << 4, positions, count, maxCount
+                    (sectionIndex + minSectionY) << 4, positions, count, maxCount, kept
                 );
             }
             removeHiddenBlockEntities(info, maxChunkSectionIndex);
@@ -225,10 +251,11 @@ public final class RayTraceObfuscation {
      * @param dataIndex index of the first byte of the section's long array in the buffer
      * @param baseY the y coordinate of the bottom of the section
      * @param positions receives the packed positions (see {@link #pack}), must have room for {@code maxCount}
+     * @param kept      packed positions that stay real, sorted ascending, or {@code null}
      * @return the new amount of recorded positions
      */
     static int hideSection(final byte[] buffer, final int dataIndex, final int bits, final boolean[] trace, final int hideId,
-                           final int baseY, final int[] positions, int count, final int maxCount) {
+                           final int baseY, final int[] positions, int count, final int maxCount, final int @Nullable [] kept) {
         final long mask = (1L << bits) - 1L;
         final long hide = hideId & mask;
         final int valuesPerLong = 64 / bits;
@@ -241,8 +268,12 @@ public final class RayTraceObfuscation {
                     if (count == maxCount) {
                         break;
                     }
+                    final int packed = pack(baseY + (index >> 8), index >> 4 & 15, index & 15);
+                    if (kept != null && Arrays.binarySearch(kept, packed) >= 0) {
+                        continue;
+                    }
                     modified = modified & ~(mask << shift) | hide << shift;
-                    positions[count++] = pack(baseY + (index >> 8), index >> 4 & 15, index & 15);
+                    positions[count++] = packed;
                 }
             }
             if (modified != word) {

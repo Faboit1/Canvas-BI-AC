@@ -618,8 +618,8 @@ public class WorldConfig extends Part {
                         case MEDIUM -> "Low, plus section anti-freecam and anti-ESP, storage traced to 48 blocks";
                         case HIGH -> "Per-block anti-freecam, ray traced anti-xray, third person cameras, storage to 64 blocks";
                         case EXTRA -> "High, traced farther and more often: storage and ores to 80 blocks, entities to 128";
-                        case MAX -> "Extra, traced farther still and every other tick, hidden ores hidden again out of sight";
-                        case ULTRA -> "Everything traced every tick without limits, the most protection for the most CPU";
+                        case MAX -> "Extra, traced farther still and every other tick, anti-freecam by line of sight to 64 blocks";
+                        case ULTRA -> "Everything traced every tick without limits, line of sight to 128 blocks, the most protection for the most CPU";
                     })
                 );
         }
@@ -660,7 +660,7 @@ public class WorldConfig extends Part {
                         "Blocks further than this many blocks from the player's eyes are not traced and keep their",
                         "current (hidden or revealed) state"
                     ).greaterThan(0.0F);
-                option("rehideBlocks").docs("Whether revealed blocks that are no longer visible are hidden again. If false, a block stays revealed until its chunk is resent");
+                option("rehideBlocks").docs("Whether revealed blocks that are no longer visible are hidden again. They show up late again once they come back into view, more so with a high ping. If false, a block stays revealed while the client has its chunk");
                 option("rehideDistance").docs("Revealed blocks at or beyond this distance are treated as invisible and are hidden again (only when \"rehide-blocks\" is enabled)").greaterThanOrEqualTo(0.0F);
                 option("maxRayTraceBlockCountPerChunk").docs("Maximum number of exposed blocks hidden and traced per chunk. Counting starts at the bottom of the world").greaterThanOrEqualTo(0.0F);
                 option("rayTraceBlocks")
@@ -674,6 +674,12 @@ public class WorldConfig extends Part {
                         "is what freecam style cheats rely on, at the cost of a short delay when turning around quickly"
                     );
                 option("updateIntervalTicks").docs("How often, in ticks, the visibility of hidden blocks is recomputed for a player that isn't moving. Moving players are updated every tick").greaterThan(0.0F);
+                option("revealMargin")
+                    .docs(
+                        "Hidden blocks within 32 blocks are also revealed when they can be seen from this many blocks around",
+                        "the eyes, so blocks coming into view while the player moves are there before they are needed, even",
+                        "with a high ping. 0 traces from the eyes alone"
+                    ).between(0.0F, 4.0F);
             }
 
             public boolean enabled = false;
@@ -685,6 +691,7 @@ public class WorldConfig extends Part {
             public List<String> rayTraceBlocks = new ArrayList<>();
             public boolean frustumCulling = true;
             public int updateIntervalTicks = 10;
+            public double revealMargin = 1.0D;
         }
 
         {
@@ -864,6 +871,35 @@ public class WorldConfig extends Part {
                 AIR, STONE
             }
             public boolean hideParticles = true;
+
+            {
+                option("lineOfSight")
+                    .docs(
+                        Style.wrap(
+                            "Per-block mode with ray tracing: only the blocks a straight line from the player's eyes really reaches",
+                            "are sent real, plus the blocks touching them and everything open to the sky. Per-block mode alone sends",
+                            "everything that could be seen from anywhere within \"reveal-margin\" of the eyes, which freecam can look",
+                            "into, caves around corners included. Third person cameras and a few points around the eyes (see",
+                            "\"line-of-sight-margin\") count as eyes too, so moving or switching the camera doesn't show filler. Turns",
+                            "on per-block mode. Costs more worker CPU, mostly in large caves, and re-sends chunks more often"
+                        )
+                    );
+                option("lineOfSightMargin")
+                    .docs(
+                        "How far, in blocks, around the eyes (and ahead of a moving player) lines of sight start too, so what",
+                        "comes into view when the player moves a little is already there. Larger values show filler less often",
+                        "when walking around corners, but let freecam see that much further"
+                    ).between(0.0F, 4.0F);
+                option("lineOfSightDistance")
+                    .docs(
+                        "Blocks farther than this from the eyes aren't ray traced, they are sent like in per-block mode. Larger",
+                        "values trace farther caves too, at more CPU in large open areas"
+                    ).between(16.0F, 1024.0F);
+            }
+
+            public boolean lineOfSight = false;
+            public double lineOfSightMargin = 1.0D;
+            public double lineOfSightDistance = 64.0D;
         }
 
         {
