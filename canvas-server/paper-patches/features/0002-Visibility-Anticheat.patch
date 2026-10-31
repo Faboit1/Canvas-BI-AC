@@ -118,16 +118,17 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..868301b3c57f6a3f10967ddcb0699858
  
          if (blockState != null && obfuscateGlobal[GLOBAL_BLOCKSTATE_PALETTE.idFor(blockState, PaletteResize.noResizeExpected())]) {
 diff --git a/src/main/java/io/papermc/paper/antixray/ChunkPacketInfoAntiXray.java b/src/main/java/io/papermc/paper/antixray/ChunkPacketInfoAntiXray.java
-index 0476a81647db316c05518768fb2b46249b44ad8a..2b5654f3d1c45ddfa04d2035a03bb594a74d5925 100644
+index 0476a81647db316c05518768fb2b46249b44ad8a..010862048d00d0af252789646e22a62aa49c70e7 100644
 --- a/src/main/java/io/papermc/paper/antixray/ChunkPacketInfoAntiXray.java
 +++ b/src/main/java/io/papermc/paper/antixray/ChunkPacketInfoAntiXray.java
-@@ -7,10 +7,15 @@ public final class ChunkPacketInfoAntiXray extends ChunkPacketInfo<BlockState> i
+@@ -7,10 +7,17 @@ public final class ChunkPacketInfoAntiXray extends ChunkPacketInfo<BlockState> i
  
      private final ChunkPacketBlockControllerAntiXray chunkPacketBlockControllerAntiXray;
      private LevelChunk[] nearbyChunks;
 +    // Canvas start - visibility anticheat
 +    private final io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation rayTraceObfuscation;
 +    private int[] rayTraceHidden;
++    private final int[] rayTraceKept;
 +    // Canvas end - visibility anticheat
  
 -    public ChunkPacketInfoAntiXray(LevelChunk chunk, ChunkPacketBlockControllerAntiXray chunkPacketBlockControllerAntiXray) {
@@ -135,10 +136,11 @@ index 0476a81647db316c05518768fb2b46249b44ad8a..2b5654f3d1c45ddfa04d2035a03bb594
          super(chunk);
          this.chunkPacketBlockControllerAntiXray = chunkPacketBlockControllerAntiXray;
 +        this.rayTraceObfuscation = rayTraceObfuscation; // Canvas - visibility anticheat
++        this.rayTraceKept = io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation.keptReal(); // Canvas - visibility anticheat
      }
  
      public LevelChunk[] getNearbyChunks() {
-@@ -21,6 +26,28 @@ public final class ChunkPacketInfoAntiXray extends ChunkPacketInfo<BlockState> i
+@@ -21,6 +28,36 @@ public final class ChunkPacketInfoAntiXray extends ChunkPacketInfo<BlockState> i
          this.nearbyChunks = nearbyChunks;
      }
  
@@ -157,6 +159,14 @@ index 0476a81647db316c05518768fb2b46249b44ad8a..2b5654f3d1c45ddfa04d2035a03bb594
 +     */
 +    public int[] getRayTraceHidden() {
 +        return this.rayTraceHidden;
++    }
++
++    /**
++     * @return the packed positions of the traced blocks this packet doesn't hide because the player got them real
++     * before, sorted ascending, or {@code null}
++     */
++    public int[] getRayTraceKept() {
++        return this.rayTraceKept;
 +    }
 +
 +    public void setRayTraceHidden(int[] rayTraceHidden) {

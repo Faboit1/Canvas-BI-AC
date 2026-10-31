@@ -1,5 +1,6 @@
 package io.canvasmc.canvas.anticheat;
 
+import io.canvasmc.canvas.anticheat.raytrace.BlockOcclusion;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
 import net.minecraft.util.Mth;
@@ -19,6 +20,19 @@ public final class CameraSnapshot {
      * Distance the client keeps between a third person camera and the block it collides with.
      */
     private static final double CAMERA_CLIP_MARGIN = 0.1;
+    /**
+     * Directions of the points around the eyes, see {@link #pointsAround}: horizontal at 45 degree steps, and up.
+     */
+    private static final double[] AROUND;
+
+    static {
+        final double diagonal = Math.sqrt(0.5);
+        AROUND = new double[] {
+            1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0,
+            diagonal, 0.0, diagonal, diagonal, 0.0, -diagonal, -diagonal, 0.0, diagonal, -diagonal, 0.0, -diagonal,
+            0.0, 1.0, 0.0
+        };
+    }
 
     public final ServerLevel level;
     /**
@@ -54,6 +68,8 @@ public final class CameraSnapshot {
 
     // volatile publishes the contents of the array to the other jobs
     private volatile double @Nullable [] cameras;
+    private volatile double @Nullable [] around;
+    private volatile double aroundMargin = Double.NaN;
 
     public CameraSnapshot(final ServerLevel level, final long epoch, final int tick,
                           final double eyeX, final double eyeY, final double eyeZ,
@@ -119,6 +135,45 @@ public final class CameraSnapshot {
             this.eyeX + this.lookX * front, this.eyeY + this.lookY * front, this.eyeZ + this.lookZ * front
         };
         return this.cameras = ret;
+    }
+
+    /**
+     * @return the points of {@link #pointsAround} the eyes, computed once per margin
+     */
+    public double[] aroundEyes(final BlockOcclusion access, final double margin) {
+        final double[] ret = this.around;
+        if (ret != null && this.aroundMargin == margin) {
+            return ret;
+        }
+        final double[] points = pointsAround(access, this.eyeX, this.eyeY, this.eyeZ, margin);
+        this.around = points;
+        this.aroundMargin = margin;
+        return points;
+    }
+
+    /**
+     * Points the eyes of a player at the given position can get to soon, so what can be seen from there can be sent
+     * before the client needs it: {@code margin} blocks away in the horizontal directions at 45 degree steps and up,
+     * each pulled in front of the first block in the way, like the client pulls in its camera.
+     *
+     * @return the points as {@code x, y, z} triples, none if the eyes are inside a block or the margin is 0
+     */
+    public static double[] pointsAround(final BlockOcclusion access, final double eyeX, final double eyeY, final double eyeZ, final double margin) {
+        if (margin <= 0.0 || access.isOpaque(Mth.floor(eyeX), Mth.floor(eyeY), Mth.floor(eyeZ))) {
+            return new double[0];
+        }
+        final double[] ret = new double[AROUND.length];
+        int count = 0;
+        for (int i = 0; i < AROUND.length; i += 3) {
+            final double clip = Math.min(margin,
+                VoxelRaycaster.clipDistance(access, eyeX, eyeY, eyeZ, AROUND[i], AROUND[i + 1], AROUND[i + 2], margin + CAMERA_CLIP_MARGIN) - CAMERA_CLIP_MARGIN);
+            if (clip > 0.05) {
+                ret[count++] = eyeX + AROUND[i] * clip;
+                ret[count++] = eyeY + AROUND[i + 1] * clip;
+                ret[count++] = eyeZ + AROUND[i + 2] * clip;
+            }
+        }
+        return count == ret.length ? ret : java.util.Arrays.copyOf(ret, count);
     }
 
     private double clip(final OcclusionAccess access, final double dirX, final double dirY, final double dirZ) {

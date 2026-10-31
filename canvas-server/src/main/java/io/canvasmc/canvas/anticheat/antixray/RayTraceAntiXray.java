@@ -52,6 +52,11 @@ import org.jspecify.annotations.Nullable;
  * cameras reaches one of its exposed faces. Passes only run when the player moved or turned, when new chunks arrived,
  * when blocks next to hidden blocks changed, or after a configured interval, so standing still costs next to
  * nothing.
+ * <p>
+ * Revealed blocks stay revealed while the client has the chunk: the entry of a chunk is kept after its last block
+ * was revealed, and a chunk sent again keeps the blocks revealed before real ({@link #revealedIn}). Otherwise every
+ * re-send, which anti-freecam does whenever it reveals blocks, would turn revealed ores back into stone until the
+ * next pass, and they would flicker.
  */
 public final class RayTraceAntiXray implements VisibilityModule {
 
@@ -77,6 +82,11 @@ public final class RayTraceAntiXray implements VisibilityModule {
      * the block itself and the client turning a little ahead of the server.
      */
     private static final double FRUSTUM_MARGIN = 1.0;
+    /**
+     * Hidden blocks within this distance are also traced from the points around the eyes ({@code reveal-margin}).
+     * Farther away the points see about the same as the eyes.
+     */
+    private static final double MARGIN_TRACE_DISTANCE_SQUARED = 32.0 * 32.0;
 
     private final PlayerVisibility owner;
     private final ConcurrentChainedLong2ReferenceHashTable<TrackedChunk> chunks = new ConcurrentChainedLong2ReferenceHashTable<>();
@@ -108,6 +118,8 @@ public final class RayTraceAntiXray implements VisibilityModule {
     private double jobRehideDistanceSquared;
     private boolean jobThirdPerson;
     private boolean jobFrustumCulling;
+    private double jobRevealMargin;
+    private double @Nullable [] jobAround;
     private boolean jobLavaObscures;
 
     // job results, written by runAsync and read by applyResults. Indices of blocks to reveal, or ~index to rehide
@@ -235,6 +247,54 @@ public final class RayTraceAntiXray implements VisibilityModule {
     }
 
     /**
+     * @return the packed positions of the blocks of the chunk the client got real, which a packet sending the chunk
+     * again must not hide, sorted ascending, or {@code null} if there are none. Blocks that are hidden again when out
+     * of sight ({@code rehide-blocks}) are sent hidden like the first time
+     */
+    public int @Nullable [] revealedIn(final LevelChunk chunk) {
+        final TrackedChunk tracked = this.chunks.get(CoordinateUtils.getChunkKey(chunk.getPos()));
+        if (tracked == null || tracked.level != chunk.getLevel() || this.owner.config().rayTraceAntiXray.rehideBlocks) {
+            return null;
+        }
+        final int[] kept = tracked.kept;
+        if (tracked.info != null) {
+            return kept.length == 0 ? null : kept;
+        }
+        final int[] positions = tracked.positions;
+        final long[] hidden = tracked.hidden;
+        int revealed = 0;
+        for (int i = 0; i < positions.length; ++i) {
+            if ((hidden[i >>> 6] & 1L << i) == 0L) {
+                ++revealed;
+            }
+        }
+        if (revealed == 0) {
+            return kept.length == 0 ? null : kept;
+        }
+        // both are sorted, merge them
+        final int[] ret = new int[kept.length + revealed];
+        int count = 0;
+        int k = 0;
+        for (int i = 0; i < positions.length; ++i) {
+            if ((hidden[i >>> 6] & 1L << i) != 0L) {
+                continue;
+            }
+            final int packed = positions[i];
+            while (k < kept.length && kept[k] < packed) {
+                ret[count++] = kept[k++];
+            }
+            if (k < kept.length && kept[k] == packed) {
+                ++k;
+            }
+            ret[count++] = packed;
+        }
+        while (k < kept.length) {
+            ret[count++] = kept[k++];
+        }
+        return count == ret.length ? ret : Arrays.copyOf(ret, count);
+    }
+
+    /**
      * Takes the hidden positions from the chunk packet once it is ready, dropping the reference to the packet info
      * (which keeps the chunk and its neighbours alive). Updates of the chunk that were filtered in the meantime are
      * reconciled with the actual positions.
@@ -298,9 +358,9 @@ public final class RayTraceAntiXray implements VisibilityModule {
             }
         }
 
-        if (positions.length == 0) {
+        if (positions.length == 0 && tracked.kept.length == 0) {
             this.chunks.remove(tracked.key, tracked);
-        } else {
+        } else if (positions.length != 0) {
             this.needsPass = true;
         }
         return true;
@@ -446,6 +506,7 @@ public final class RayTraceAntiXray implements VisibilityModule {
         this.jobRehideDistanceSquared = config.rehideDistance * config.rehideDistance;
         this.jobThirdPerson = config.rayTraceThirdPerson;
         this.jobFrustumCulling = config.frustumCulling;
+        this.jobRevealMargin = config.revealMargin;
         this.jobLavaObscures = snapshot.level.paperConfig().anticheat.antiXray.lavaObscures;
         return true;
     }
@@ -473,6 +534,8 @@ public final class RayTraceAntiXray implements VisibilityModule {
 
         // the client's camera isn't stopped by lava, the cameras are shared with the other modules
         final double @Nullable [] cameras = this.jobThirdPerson ? snapshot.cameras(access) : null;
+        // the points around the eyes go into the client's walls the way its camera does, lava doesn't stop them
+        this.jobAround = this.jobRevealMargin > 0.0 ? snapshot.aroundEyes(access, this.jobRevealMargin) : null;
         access.setLavaObscures(this.jobLavaObscures);
         this.trace(snapshot, access, cameras);
     }
@@ -524,7 +587,8 @@ public final class RayTraceAntiXray implements VisibilityModule {
                 continue;
             }
             final boolean visible = (!rehide || blockDistanceSquared < this.jobRehideDistanceSquared)
-                && this.isVisible(access, snapshot, cameras, x, y, z);
+                && (this.isVisible(access, snapshot, cameras, x, y, z)
+                || blockDistanceSquared < MARGIN_TRACE_DISTANCE_SQUARED && this.isVisibleAround(access, snapshot, x, y, z));
             if (visible == isHidden) {
                 this.addResult(tracked, visible ? i : ~i);
             }
@@ -547,6 +611,23 @@ public final class RayTraceAntiXray implements VisibilityModule {
             // the cameras are the eyes, the back camera looking ahead and the front camera looking back
             final double sign = i == 6 ? -1.0 : 1.0;
             if (this.isVisibleFrom(access, x, y, z, camX, camY, camZ, snapshot.lookX * sign, snapshot.lookY * sign, snapshot.lookZ * sign)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the block can be seen from one of the points around the eyes, where the eyes can be before the next
+     * reveal reaches the client.
+     */
+    private boolean isVisibleAround(final BlockOcclusion access, final CameraSnapshot snapshot, final int x, final int y, final int z) {
+        final double[] around = this.jobAround;
+        if (around == null) {
+            return false;
+        }
+        for (int i = 0; i < around.length; i += 3) {
+            if (this.isVisibleFrom(access, x, y, z, around[i], around[i + 1], around[i + 2], snapshot.lookX, snapshot.lookY, snapshot.lookZ)) {
                 return true;
             }
         }
@@ -582,13 +663,12 @@ public final class RayTraceAntiXray implements VisibilityModule {
     public void applyResults(final CameraSnapshot snapshot) {
         final int count = this.resultCount;
         this.resultCount = 0;
-        final boolean rehide = this.owner.config().rayTraceAntiXray.rehideBlocks;
         TrackedChunk revealed = null;
         for (int i = 0; i < count; ++i) {
             final TrackedChunk tracked = this.resultChunks[i];
             this.resultChunks[i] = null;
             if (tracked != revealed && revealed != null) {
-                this.onRevealed(revealed, rehide);
+                onRevealed(revealed);
                 revealed = null;
             }
             if (this.chunks.get(tracked.key) != tracked || tracked.level != this.owner.player.level()) {
@@ -603,7 +683,7 @@ public final class RayTraceAntiXray implements VisibilityModule {
             }
         }
         if (revealed != null) {
-            this.onRevealed(revealed, rehide);
+            onRevealed(revealed);
         }
     }
 
@@ -655,15 +735,11 @@ public final class RayTraceAntiXray implements VisibilityModule {
     }
 
     /**
-     * Shrinks the sections with hidden blocks after reveals, and stops tracking chunks without hidden blocks when
-     * nothing will be hidden again.
+     * Shrinks the sections with hidden blocks after reveals. Chunks without hidden blocks stay tracked, so sending
+     * them again keeps what was revealed.
      */
-    private void onRevealed(final TrackedChunk tracked, final boolean rehide) {
-        final long sections = tracked.sectionsOf(false);
-        tracked.hiddenSections = sections;
-        if (sections == 0L && !rehide && !tracked.anyHidden()) {
-            this.chunks.remove(tracked.key, tracked);
-        }
+    private static void onRevealed(final TrackedChunk tracked) {
+        tracked.hiddenSections = tracked.sectionsOf(false);
     }
 
     private @Nullable LevelChunk ownedChunk(final TrackedChunk tracked) {
@@ -707,6 +783,10 @@ public final class RayTraceAntiXray implements VisibilityModule {
          * are valid.
          */
         volatile @Nullable ChunkPacketInfoAntiXray info;
+        /**
+         * Packed positions of the traced blocks the packet sent real because they were revealed before, sorted.
+         */
+        final int[] kept;
         int[] positions = NO_POSITIONS;
         /**
          * Bit {@code i} is set while {@code positions[i]} is hidden from the player. Only changed atomically.
@@ -731,6 +811,8 @@ public final class RayTraceAntiXray implements VisibilityModule {
             this.level = (ServerLevel) chunk.getLevel();
             this.obfuscation = info.getRayTraceObfuscation();
             this.info = info;
+            final int[] kept = info.getRayTraceKept();
+            this.kept = kept == null ? NO_POSITIONS : kept;
         }
 
         static long sectionBit(final int sectionIndex) {
@@ -761,15 +843,6 @@ public final class RayTraceAntiXray implements VisibilityModule {
                 }
             }
             return ret;
-        }
-
-        boolean anyHidden() {
-            for (final long word : this.hidden) {
-                if (word != 0L) {
-                    return true;
-                }
-            }
-            return false;
         }
 
         /**

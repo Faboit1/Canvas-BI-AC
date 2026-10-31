@@ -69,6 +69,12 @@ import org.jspecify.annotations.Nullable;
  * outside the camera box that can't currently be seen are withheld, the block counting as filler until the chunk is
  * re-sent, so a player that saw a place once doesn't keep receiving what happens there.
  * <p>
+ * <b>Line of sight</b> ({@code line-of-sight}) narrows per-block mode down to what straight lines from the cameras
+ * really reach ({@link CellVisibility.Sight}): the eyes, the third person cameras, a point ahead of a moving player
+ * and a few points within {@code line-of-sight-margin} of the eyes. The camera box then only bounds the search, and
+ * the second layer of blocks the player may break only extends as far as the player can reach. Moving the eyes
+ * half a block or turning the camera starts a new computation.
+ * <p>
  * Threading: everything runs on the player's region thread, except {@link #runAsync} (PVS computation on an
  * anticheat worker) and the leak filters {@link #isSectionMasked}, {@link #isMasked} and {@link #filterLightUpdate},
  * which read the sent chunks through a concurrent map and volatile state per chunk. Withholding updates and the
@@ -111,6 +117,33 @@ public final class FreecamGuard implements VisibilityModule {
      * Minimum ticks between two checks of the PVS requested by {@link #onOpacityChange}.
      */
     private static final int OPACITY_CHECK_INTERVAL = 5;
+    /**
+     * Line of sight: how far, in blocks, the eyes move before what they see is computed again.
+     */
+    private static final double SIGHT_MOVE = 1.0;
+    /**
+     * Line of sight: a player that stopped this far from where the last result was computed gets one for where it
+     * stands. The points around the eyes only sample the margin, a player standing still between them must still
+     * get everything it sees.
+     */
+    private static final double SIGHT_STOP_MOVE = 0.05;
+
+    /**
+     * Line of sight: the directions in which third person cameras are sampled, whichever way the player looks: a
+     * client turns its camera faster than the server could follow.
+     */
+    private static final double[] THIRD_PERSON_DIRECTIONS;
+
+    static {
+        THIRD_PERSON_DIRECTIONS = new double[3 * 6];
+        int i = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int sign = -1; sign <= 1; sign += 2) {
+                THIRD_PERSON_DIRECTIONS[i * 3 + axis] = sign;
+                ++i;
+            }
+        }
+    }
 
     private static final AtomicBoolean WARNED_HEIGHT = new AtomicBoolean();
     private static final ThreadLocal<Worker> WORKERS = ThreadLocal.withInitial(Worker::new);
@@ -138,6 +171,10 @@ public final class FreecamGuard implements VisibilityModule {
      * Whether the state is kept per block, the {@code per-block} option it was built for.
      */
     private boolean perBlock;
+    /**
+     * Whether per-block mode only shows what lines of sight reach, the {@code line-of-sight} option.
+     */
+    private boolean lineOfSight;
 
     // region thread state
     private @Nullable Pvs current;
@@ -177,6 +214,17 @@ public final class FreecamGuard implements VisibilityModule {
      * is computed.
      */
     private final int[] requiredBox = new int[6];
+    /**
+     * Line of sight: the blocks around the eyes the player may break, where a second layer of blocks is visible.
+     */
+    private final int[] digBox = new int[6];
+    /**
+     * Line of sight: where the eyes will be after the lookahead, relative to them.
+     */
+    private double aheadX;
+    private double aheadY;
+    private double aheadZ;
+    private final double[] lastJobSight = new double[3];
     private @Nullable Level boxLevel;
     private final int[] lastJobBox = new int[6];
     private final int[] lastJobBlockBox = new int[6];
@@ -202,6 +250,13 @@ public final class FreecamGuard implements VisibilityModule {
     private boolean jobCheckOnly;
     private final int[] jobBox = new int[6];
     private final int[] jobBlockBox = new int[6];
+    private final int[] jobDigBox = new int[6];
+    private boolean jobLineOfSight;
+    private double jobSightMargin;
+    private double jobSightDistance;
+    private double jobAheadX;
+    private double jobAheadY;
+    private double jobAheadZ;
 
     public FreecamGuard(final PlayerVisibility owner) {
         this.owner = owner;
@@ -493,6 +548,7 @@ public final class FreecamGuard implements VisibilityModule {
 
         final OcclusionGraph graph = new OcclusionGraph();
         final CellVisibility cells = new CellVisibility();
+        final CellVisibility.Sight sight = new CellVisibility.Sight();
         final SectionVisibility.Scratch scratch = new SectionVisibility.Scratch();
         final int[] cameras = new int[9];
         LevelChunkSection[] @Nullable [] columns = new LevelChunkSection[0][];
@@ -715,6 +771,13 @@ public final class FreecamGuard implements VisibilityModule {
         startBox(this.blockBox, this.box, snapshot.level, snapshot.eyeX, snapshot.eyeY, snapshot.eyeZ, this.margin(config, snapshot.cameraDistance),
             snapshot.velocityX * scale, snapshot.velocityY * scale, snapshot.velocityZ * scale);
         this.boxLevel = snapshot.level;
+        this.aheadX = snapshot.velocityX * scale;
+        this.aheadY = snapshot.velocityY * scale;
+        this.aheadZ = snapshot.velocityZ * scale;
+        if (this.lineOfSight) {
+            startBox(this.digBox, null, snapshot.level, snapshot.eyeX, snapshot.eyeY, snapshot.eyeZ,
+                this.owner.player.blockInteractionRange() + 1.0, 0.0, 0.0, 0.0);
+        }
 
         if (this.perBlock) {
             startBox(this.requiredBox, null, snapshot.level, snapshot.eyeX, snapshot.eyeY, snapshot.eyeZ,
@@ -738,10 +801,23 @@ public final class FreecamGuard implements VisibilityModule {
      * masked, so they are re-sent once visible.
      */
     private void updateMode(final WorldConfig.Anticheat.AntiFreecam config) {
-        if (config.perBlock == this.perBlock) {
+        final boolean perBlock = config.perBlock || config.lineOfSight;
+        if (config.lineOfSight != this.lineOfSight && perBlock == this.perBlock) {
+            // the client keeps what it has, a new PVS shows more or withholds more from now on
+            this.lineOfSight = config.lineOfSight;
+            ++this.generation;
+            this.current = null;
+            this.spare = null;
+            this.overlay = null;
+            this.chunksChanged = true;
+            this.jobScheduled = false;
             return;
         }
-        this.perBlock = config.perBlock;
+        this.lineOfSight = config.lineOfSight;
+        if (perBlock == this.perBlock) {
+            return;
+        }
+        this.perBlock = perBlock;
         ++this.generation;
         this.current = null;
         this.spare = null;
@@ -799,6 +875,17 @@ public final class FreecamGuard implements VisibilityModule {
             // the player moved half the margin away from where the last job was computed
             boxChanged = !contains(this.lastJobBlockBox, this.requiredBox);
         }
+        if (this.lineOfSight && !boxChanged) {
+            // the third person cameras are sampled all around, turning needs no new computation
+            final double[] last = this.lastJobSight;
+            final double dx = snapshot.eyeX - last[0];
+            final double dy = snapshot.eyeY - last[1];
+            final double dz = snapshot.eyeZ - last[2];
+            final double moved = dx * dx + dy * dy + dz * dz;
+            final boolean stopped = snapshot.velocityX * snapshot.velocityX + snapshot.velocityY * snapshot.velocityY
+                + snapshot.velocityZ * snapshot.velocityZ < 1.0E-4;
+            boxChanged = moved > SIGHT_MOVE * SIGHT_MOVE || stopped && moved > SIGHT_STOP_MOVE * SIGHT_STOP_MOVE;
+        }
         final boolean urgent = this.urgentCheck;
         final int sinceLastJob = snapshot.tick - this.lastJobTick;
         final boolean periodic = sinceLastJob >= config.updateIntervalTicks || sinceLastJob < 0
@@ -830,9 +917,24 @@ public final class FreecamGuard implements VisibilityModule {
         this.jobPrevious = this.current;
         this.jobResult = result;
         System.arraycopy(this.box, 0, this.jobBox, 0, 6);
-        System.arraycopy(this.box, 0, this.lastJobBox, 0, 6);
         System.arraycopy(this.blockBox, 0, this.jobBlockBox, 0, 6);
-        System.arraycopy(this.blockBox, 0, this.lastJobBlockBox, 0, 6);
+        System.arraycopy(this.digBox, 0, this.jobDigBox, 0, 6);
+        if (!this.jobCheckOnly) {
+            // what the next job is compared with: a check only keeps the result of where it was computed, so moving
+            // the reference along with checks would never compute a new one for a player moving a little every tick
+            System.arraycopy(this.box, 0, this.lastJobBox, 0, 6);
+            System.arraycopy(this.blockBox, 0, this.lastJobBlockBox, 0, 6);
+            final double[] last = this.lastJobSight;
+            last[0] = snapshot.eyeX;
+            last[1] = snapshot.eyeY;
+            last[2] = snapshot.eyeZ;
+        }
+        this.jobLineOfSight = this.lineOfSight;
+        this.jobSightMargin = config.lineOfSightMargin;
+        this.jobSightDistance = config.lineOfSightDistance;
+        this.jobAheadX = this.aheadX;
+        this.jobAheadY = this.aheadY;
+        this.jobAheadZ = this.aheadZ;
         this.jobScheduled = true;
         this.chunksChanged = false;
         this.lastJobTick = snapshot.tick;
@@ -899,9 +1001,23 @@ public final class FreecamGuard implements VisibilityModule {
         }
         System.arraycopy(this.jobBlockBox, 0, result.blockBox, 0, 6);
         final CellVisibility cells = worker.cells;
-        // the player may dig anywhere in the box, two layers of blocks are visible there
+        CellVisibility.Sight sight = null;
+        if (this.jobLineOfSight) {
+            sight = worker.sight;
+            sight.clear();
+            sight.add(cameras[0], cameras[1], cameras[2]);
+            // the third person cameras where the player looks now first, they are the likeliest ones
+            for (int i = 1; i < 3; ++i) {
+                sight.add(cameras[i * 3], cameras[i * 3 + 1], cameras[i * 3 + 2]);
+            }
+            addAround(sight, access, cameras[0], cameras[1], cameras[2], this.jobSightMargin, this.jobAheadX, this.jobAheadY, this.jobAheadZ,
+                snapshot.cameraDistance);
+            sight.maxDistanceSquared = this.jobSightDistance * this.jobSightDistance;
+        }
+        // the player may dig anywhere in the box, or only within reach with line of sight, two layers of blocks are
+        // visible there
         cells.compute(worker, result.width, result.depth, result.height, result.originX, result.originZ, result.minSectionY,
-            worker.domain, true, worker.cameras, 3, result.blockBox, result.blockBox);
+            worker.domain, true, worker.cameras, 3, result.blockBox, sight == null ? result.blockBox : this.jobDigBox, sight);
 
         final Pvs previous = this.jobPrevious;
         final Level level = result.level;
@@ -1090,6 +1206,49 @@ public final class FreecamGuard implements VisibilityModule {
     }
 
     /**
+     * Line of sight: adds the camera points around the eyes, wherever a camera can get to before a result computed
+     * for it reaches the client, which is a round trip and a computation later:
+     * <ul>
+     *     <li>the point ahead of a moving player ({@link #lookahead});</li>
+     *     <li>{@code line-of-sight-margin} around the eyes ({@link CameraSnapshot#pointsAround}), for a player
+     *     changing direction or jumping;</li>
+     *     <li>third person cameras all around, a client turns its camera within a frame.</li>
+     * </ul>
+     * Each is pulled in front of the first block in the way, like the client pulls in its camera.
+     */
+    private static void addAround(final CellVisibility.Sight sight, final OcclusionAccess access, final double eyeX, final double eyeY,
+                                  final double eyeZ, final double margin, final double aheadX, final double aheadY, final double aheadZ,
+                                  final double cameraDistance) {
+        if (access.isOpaque(Mth.floor(eyeX), Mth.floor(eyeY), Mth.floor(eyeZ))) {
+            // the client can't move its camera out of the block either
+            return;
+        }
+        final double ahead = Math.sqrt(aheadX * aheadX + aheadY * aheadY + aheadZ * aheadZ);
+        if (ahead > 1.0E-3) {
+            addClipped(sight, access, eyeX, eyeY, eyeZ, aheadX / ahead, aheadY / ahead, aheadZ / ahead, ahead);
+        }
+        sight.primaryDone();
+        final double[] around = CameraSnapshot.pointsAround(access, eyeX, eyeY, eyeZ, margin);
+        for (int i = 0; i < around.length; i += 3) {
+            sight.add(around[i], around[i + 1], around[i + 2]);
+        }
+        if (cameraDistance > 0.0) {
+            for (int i = 0; i < THIRD_PERSON_DIRECTIONS.length; i += 3) {
+                addClipped(sight, access, eyeX, eyeY, eyeZ, THIRD_PERSON_DIRECTIONS[i], THIRD_PERSON_DIRECTIONS[i + 1], THIRD_PERSON_DIRECTIONS[i + 2],
+                    cameraDistance);
+            }
+        }
+    }
+
+    private static void addClipped(final CellVisibility.Sight sight, final OcclusionAccess access, final double eyeX, final double eyeY,
+                                   final double eyeZ, final double dirX, final double dirY, final double dirZ, final double distance) {
+        final double clip = Math.min(distance, VoxelRaycaster.clipDistance(access, eyeX, eyeY, eyeZ, dirX, dirY, dirZ, distance + 0.1) - 0.1);
+        if (clip > 0.05) {
+            sight.add(eyeX + dirX * clip, eyeY + dirY * clip, eyeZ + dirZ * clip);
+        }
+    }
+
+    /**
      * Computes the blocks, and the sections, a camera within {@code margin} blocks of the eyes, or along the given
      * movement, could be in. The result may extend outside the world.
      *
@@ -1249,7 +1408,7 @@ public final class FreecamGuard implements VisibilityModule {
                 return ret;
             }
             worker.cells.compute(worker, 3, 3, sections, chunk.getPos().x() - 1, chunk.getPos().z() - 1, chunk.getMinSectionY(),
-                worker.domain, true, worker.cameras, 0, this.blockBox, null);
+                worker.domain, true, worker.cameras, 0, this.blockBox, null, null);
             for (int index = 0; index < sections; ++index) {
                 ret[index] = blocksOf(worker.cells, 4, index);
             }
@@ -1526,7 +1685,18 @@ public final class FreecamGuard implements VisibilityModule {
             worker.cameras[0] = Mth.floor(eyeX);
             worker.cameras[1] = Mth.floor(eyeY);
             worker.cameras[2] = Mth.floor(eyeZ);
-            worker.cells.compute(worker, width, depth, height, originX, originZ, minSectionY, worker.domain, false, worker.cameras, 1, box, box);
+            CellVisibility.Sight sight = null;
+            int[] near = box;
+            if (this.lineOfSight) {
+                // what the eyes see right here, not the whole box
+                sight = worker.sight;
+                sight.clear();
+                sight.add(eyeX, eyeY, eyeZ);
+                addAround(sight, this.access(level), eyeX, eyeY, eyeZ, this.owner.config().antiFreecam.lineOfSightMargin, 0.0, 0.0, 0.0,
+                    this.currentCameraDistance());
+                startBox(near = new int[6], null, level, eyeX, eyeY, eyeZ, this.owner.player.blockInteractionRange() + 1.0, 0.0, 0.0, 0.0);
+            }
+            worker.cells.compute(worker, width, depth, height, originX, originZ, minSectionY, worker.domain, false, worker.cameras, 1, box, near, sight);
             // visible blocks can lie one section beyond the box
             for (int column = 0; column < width * depth; ++column) {
                 if (!worker.hasColumn(column)) {
