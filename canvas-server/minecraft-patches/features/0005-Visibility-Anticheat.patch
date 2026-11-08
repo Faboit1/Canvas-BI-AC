@@ -174,10 +174,10 @@ index 9c83ad4d41a8b97331c94e3ea260e04096caca5b..1d3f5d98c24771b1cf09eb8cb4585803
      // Paper end - Optimize network
  }
 diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..88a3934b6b949393591bdfb33a68c51b4615244d 100644
+index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..5ad5bb0eb95006e420894ae37532a7d4a756f2f0 100644
 --- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 +++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-@@ -60,6 +60,39 @@ public class ClientboundLevelChunkPacketData {
+@@ -60,6 +60,44 @@ public class ClientboundLevelChunkPacketData {
          this.ready = ready;
      }
      // Paper end - Async-Anti-Xray - Ready flag for the connection
@@ -213,11 +213,16 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..88a3934b6b949393591bdfb33a68c51b
 +     * partly as filler, {@code null} for sections that weren't. {@code null} if no section was.
 +     */
 +    public final long @Nullable [] @Nullable [] canvas$visibleCells;
++    /**
++     * Bit set of the masked chunk section indexes that were written with the biomes of the top section instead of
++     * their own.
++     */
++    public final long canvas$maskedBiomes;
 +    // Canvas end - visibility anticheat - anti-freecam
  
      @Deprecated @io.papermc.paper.annotation.DoNotUse // Paper - Anti-Xray - Add chunk packet info
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk) {
-@@ -68,20 +101,54 @@ public class ClientboundLevelChunkPacketData {
+@@ -68,20 +106,55 @@ public class ClientboundLevelChunkPacketData {
      }
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
          // Paper end - Anti-Xray - Add chunk packet info
@@ -250,6 +255,7 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..88a3934b6b949393591bdfb33a68c51b
 +    public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final long maskedSections, final long @Nullable [] @Nullable [] visibleCells, final long maskedBiomes, final io.canvasmc.canvas.anticheat.disguise.@Nullable ChunkRewrite disguises) {
 +        this.canvas$maskedSections = maskedSections;
 +        this.canvas$visibleCells = visibleCells;
++        this.canvas$maskedBiomes = maskedBiomes;
 +        final io.canvasmc.canvas.anticheat.freecam.ChunkMasking.@Nullable MaskedBlocks[] maskedBlocks = maskBlocks(levelChunk, maskedSections, visibleCells, disguises);
 +        // Canvas end - visibility anticheat - anti-freecam
 +        this.canvas$chunkPacketInfo = chunkPacketInfo; // Canvas - visibility anticheat
@@ -274,7 +280,7 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..88a3934b6b949393591bdfb33a68c51b
              // Paper start - Handle oversized block entities in chunks
              if (++totalTileEntities > BLOCK_ENTITY_LIMIT) {
                  net.minecraft.network.protocol.Packet<ClientGamePacketListener> packet = blockEntity.getUpdatePacket(); // Canvas - optimize block entity fetching
-@@ -101,14 +168,51 @@ public class ClientboundLevelChunkPacketData {
+@@ -101,14 +174,52 @@ public class ClientboundLevelChunkPacketData {
          this.heightmaps = heightmaps;
          this.buffer = buffer;
          this.blockEntitiesData = blockEntitiesData;
@@ -282,6 +288,7 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..88a3934b6b949393591bdfb33a68c51b
 +        // Canvas start - visibility anticheat - anti-freecam
 +        this.canvas$maskedSections = 0L;
 +        this.canvas$visibleCells = null;
++        this.canvas$maskedBiomes = 0L;
 +        // Canvas end - visibility anticheat - anti-freecam
      }
  
@@ -329,7 +336,7 @@ index f2ef35aebcfec7afc7a7798a7786c949f1c2de42..88a3934b6b949393591bdfb33a68c51b
  
          return total;
      }
-@@ -125,8 +229,23 @@ public class ClientboundLevelChunkPacketData {
+@@ -125,8 +236,23 @@ public class ClientboundLevelChunkPacketData {
          extractChunkData(buffer, chunk, null);
      }
      public static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
@@ -427,15 +434,18 @@ index 1b83d541378c98e3517904973e3ea4e33098a914..86698336508a7a347adc1818d08ece45
          // Paper start - Anti-Xray - Modify blocks
          if (chunkPacketInfo != null) {
 diff --git a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..963d6f923070fe740ee4d41c9408942149fe6785 100644
+index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..6cf426e1f32e44e027ce2324289a6ce657a5381e 100644
 --- a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
 +++ b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-@@ -48,6 +48,73 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
+@@ -48,6 +48,76 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
          this.states = blockChanges.values().toArray(new BlockState[0]);
      }
      // Paper end - Multi Block Change API
 +    // Canvas start - visibility anticheat
-+    private ClientboundSectionBlocksUpdatePacket(final SectionPos sectionPos, final short[] positions, final BlockState[] states) {
++    /**
++     * @param positions section relative positions ({@code x << 8 | z << 4 | y}), each state at the same index
++     */
++    public ClientboundSectionBlocksUpdatePacket(final SectionPos sectionPos, final short[] positions, final BlockState[] states) {
 +        this.sectionPos = sectionPos;
 +        this.positions = positions;
 +        this.states = states;
