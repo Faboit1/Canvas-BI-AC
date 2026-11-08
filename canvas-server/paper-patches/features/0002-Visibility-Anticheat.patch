@@ -7,10 +7,10 @@ Registers the bypass permissions of Canvas' visibility anticheat with a
 default of false, so operators aren't silently exempt.
 
 diff --git a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java
-index 819d4d0307f53e40cb5de3fc6517771e0b3fe859..cfb879aa5dbac3193ea5ab737886012328161019 100644
+index 819d4d0307f53e40cb5de3fc6517771e0b3fe859..732d01fc518c2d6a0d5653b6c4323dd16ab32a88 100644
 --- a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java
 +++ b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockController.java
-@@ -43,4 +43,14 @@ public class ChunkPacketBlockController {
+@@ -43,4 +43,39 @@ public class ChunkPacketBlockController {
      public void onPlayerLeftClickBlock(Level level, BlockPos blockPos, ServerboundPlayerActionPacket.Action action, Direction direction, int worldHeight, int sequence) {
  
      }
@@ -23,10 +23,35 @@ index 819d4d0307f53e40cb5de3fc6517771e0b3fe859..cfb879aa5dbac3193ea5ab7378860123
 +    public boolean canvas$mayObfuscate(Level level, BlockState state) {
 +        return false;
 +    }
++
++    /**
++     * Whether chunk packets hide the blocks of {@link #canvas$mayObfuscate} that aren't exposed by sending them as
++     * {@link #canvas$hideState}, deciding per block from its neighbors alone, so that block updates can send a block
++     * exactly like a chunk packet would.
++     */
++    public boolean canvas$hidesLikeBlockUpdates() {
++        return true;
++    }
++
++    /**
++     * @return what chunk packets send instead of a hidden block at the given height, or {@code null} if blocks at
++     * that height are never hidden
++     */
++    public @org.jspecify.annotations.Nullable BlockState canvas$hideState(Level level, int y) {
++        return null;
++    }
++
++    /**
++     * Whether the block hides the faces of its neighbors, so that a hidden block next to only such blocks isn't
++     * exposed.
++     */
++    public boolean canvas$isSolid(BlockState state) {
++        return true;
++    }
 +    // Canvas end - visibility anticheat
  }
 diff --git a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
-index 86e7f42bd8ba10ec92a18889effa4b341edebc47..868301b3c57f6a3f10967ddcb0699858dc5f57cc 100644
+index 86e7f42bd8ba10ec92a18889effa4b341edebc47..211091e9d6e1a54b4a9a877a78f286aac31c09b5 100644
 --- a/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
 +++ b/src/main/java/io/papermc/paper/antixray/ChunkPacketBlockControllerAntiXray.java
 @@ -140,6 +140,9 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
@@ -96,7 +121,7 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..868301b3c57f6a3f10967ddcb0699858
          chunkPacketInfoAntiXray.getChunkPacket().setReady(true);
      }
  
-@@ -665,7 +700,20 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
+@@ -665,7 +700,37 @@ public final class ChunkPacketBlockControllerAntiXray extends ChunkPacketBlockCo
          }
      }
  
@@ -106,6 +131,23 @@ index 86e7f42bd8ba10ec92a18889effa4b341edebc47..868301b3c57f6a3f10967ddcb0699858
 +        final io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation rayTraceObfuscation = this.rayTraceObfuscation(level);
 +        final boolean[] obfuscateGlobal = rayTraceObfuscation == null ? this.obfuscateGlobal : rayTraceObfuscation.obfuscateGlobal();
 +        return obfuscateGlobal[GLOBAL_BLOCKSTATE_PALETTE.idFor(state, PaletteResize.noResizeExpected())];
++    }
++
++    @Override
++    public boolean canvas$hidesLikeBlockUpdates() {
++        // engine-mode 2 and 3 replace blocks with random ores, which only a chunk packet can reproduce
++        return engineMode == EngineMode.HIDE;
++    }
++
++    @Override
++    public BlockState canvas$hideState(Level level, int y) {
++        final BlockState[] presets = this.getPresetBlockStates(level, null, y >> 4);
++        return presets == null || engineMode != EngineMode.HIDE ? null : presets[0];
++    }
++
++    @Override
++    public boolean canvas$isSolid(BlockState state) {
++        return solidGlobal[GLOBAL_BLOCKSTATE_PALETTE.idFor(state, PaletteResize.noResizeExpected())];
 +    }
 +    // Canvas end - visibility anticheat
 +

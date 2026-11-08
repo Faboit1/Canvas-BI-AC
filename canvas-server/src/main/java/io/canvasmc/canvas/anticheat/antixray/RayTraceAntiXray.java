@@ -295,6 +295,116 @@ public final class RayTraceAntiXray implements VisibilityModule {
     }
 
     /**
+     * What the client has at a position, see {@link #trackedAt}: a traced block anti-xray doesn't track
+     */
+    public static final int UNTRACKED = 0;
+    /**
+     * A traced block the client has hidden
+     */
+    public static final int HIDDEN = 1;
+    /**
+     * A traced block the client got real
+     */
+    public static final int REAL = 2;
+    /**
+     * Unknown, the packet of the chunk is still being obfuscated
+     */
+    public static final int PENDING = 3;
+
+    /**
+     * Whether the client has a traced block at the position hidden or real, as far as this module tracks it. Only
+     * called on the player's thread.
+     *
+     * @return {@link #UNTRACKED}, {@link #HIDDEN}, {@link #REAL} or {@link #PENDING}
+     */
+    public int trackedAt(final int x, final int y, final int z) {
+        final TrackedChunk tracked = this.chunks.get(CoordinateUtils.getChunkKey(x >> 4, z >> 4));
+        if (tracked == null) {
+            return UNTRACKED;
+        }
+        if (tracked.info != null) {
+            return PENDING;
+        }
+        final int packed = RayTraceObfuscation.pack(y, z & 15, x & 15);
+        final int index = Arrays.binarySearch(tracked.positions, packed);
+        if (index >= 0) {
+            return (tracked.hidden[index >>> 6] >>> index & 1L) != 0L ? HIDDEN : REAL;
+        }
+        return Arrays.binarySearch(tracked.kept, packed) >= 0 ? REAL : UNTRACKED;
+    }
+
+    /**
+     * Whether the packet of the chunk is still being obfuscated, so which of its blocks the client has hidden isn't
+     * known yet. Only called on the player's thread.
+     */
+    public boolean isObfuscating(final int chunkX, final int chunkZ) {
+        final TrackedChunk tracked = this.chunks.get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
+        return tracked != null && tracked.info != null;
+    }
+
+    /**
+     * @return how many more blocks of the chunk {@link #hide} may hide, the limit a chunk packet hides at most
+     */
+    public int hideCapacity(final LevelChunk chunk, final RayTraceObfuscation obfuscation) {
+        final TrackedChunk tracked = this.chunks.get(CoordinateUtils.getChunkKey(chunk.getPos()));
+        return Math.max(0, obfuscation.maxBlockCount() - (tracked == null ? 0 : tracked.positions.length));
+    }
+
+    /**
+     * Starts tracking traced blocks of a sent chunk as hidden, which the client got hidden through block updates
+     * instead of a chunk packet: anti-freecam revealing blocks that were filler. They are revealed like the blocks
+     * a chunk packet hid. Only called on the player's thread, never while the chunk's packet is being obfuscated
+     * ({@link #PENDING}), for positions that aren't tracked yet.
+     *
+     * @param packed {@code count} positions, see {@link RayTraceObfuscation#pack}
+     */
+    public void hide(final LevelChunk chunk, final RayTraceObfuscation obfuscation, final int[] packed, final int count) {
+        if (count == 0) {
+            return;
+        }
+        final long key = CoordinateUtils.getChunkKey(chunk.getPos());
+        final TrackedChunk old = this.chunks.get(key);
+        if (old != null && old.info != null) {
+            return;
+        }
+        final int[] added = Arrays.copyOf(packed, count);
+        Arrays.sort(added);
+        final int[] oldPositions = old == null ? NO_POSITIONS : old.positions;
+        final long[] oldHidden = old == null ? NO_BITS : old.hidden;
+        final int[] positions = new int[oldPositions.length + count];
+        final long[] hidden = new long[(positions.length + 63) >>> 6];
+        int i = 0;
+        int j = 0;
+        int n = 0;
+        while (i < oldPositions.length || j < count) {
+            final boolean takeOld = j >= count || i < oldPositions.length && oldPositions[i] <= added[j];
+            if (takeOld) {
+                if (j < count && oldPositions[i] == added[j]) {
+                    // tracked already, it stays as it is
+                    ++j;
+                }
+                if ((oldHidden[i >>> 6] >>> i & 1L) != 0L) {
+                    hidden[n >>> 6] |= 1L << n;
+                }
+                positions[n++] = oldPositions[i++];
+            } else {
+                if (n == 0 || positions[n - 1] != added[j]) {
+                    hidden[n >>> 6] |= 1L << n;
+                    positions[n++] = added[j];
+                }
+                ++j;
+            }
+        }
+        // a new entry rather than changing the old one: other threads read the positions and their bits together,
+        // and results of a running pass for the old entry are dropped
+        final TrackedChunk tracked = new TrackedChunk(key, chunk, obfuscation, old == null ? NO_POSITIONS : old.kept,
+            n == positions.length ? positions : Arrays.copyOf(positions, n), hidden.length == (n + 63) >>> 6 ? hidden : Arrays.copyOf(hidden, (n + 63) >>> 6));
+        tracked.hiddenSections = tracked.sectionsOf(false);
+        this.chunks.put(key, tracked);
+        this.needsPass = true;
+    }
+
+    /**
      * Takes the hidden positions from the chunk packet once it is ready, dropping the reference to the packet info
      * (which keeps the chunk and its neighbours alive). Updates of the chunk that were filtered in the meantime are
      * reconciled with the actual positions.
@@ -802,6 +912,23 @@ public final class RayTraceAntiXray implements VisibilityModule {
          * bit set if the update was withheld. Guarded by this.
          */
         @Nullable LongArrayList pendingUpdates;
+
+        /**
+         * An entry whose positions are known already, see {@link #hide}.
+         */
+        TrackedChunk(final long key, final LevelChunk chunk, final RayTraceObfuscation obfuscation, final int[] kept, final int[] positions,
+                     final long[] hidden) {
+            this.key = key;
+            this.chunkX = chunk.getPos().x();
+            this.chunkZ = chunk.getPos().z();
+            this.minSectionY = chunk.getMinSectionY();
+            this.level = (ServerLevel) chunk.getLevel();
+            this.obfuscation = obfuscation;
+            this.info = null;
+            this.kept = kept;
+            this.positions = positions;
+            this.hidden = hidden;
+        }
 
         TrackedChunk(final long key, final LevelChunk chunk, final ChunkPacketInfoAntiXray info) {
             this.key = key;

@@ -104,6 +104,13 @@ public final class RayTraceObfuscation {
     }
 
     /**
+     * The most traced blocks a chunk packet hides, counting from the bottom of the chunk.
+     */
+    public int maxBlockCount() {
+        return this.maxBlockCount;
+    }
+
+    /**
      * Whether the state belongs to a block that is hidden while exposed and revealed by ray tracing.
      */
     public boolean isTraced(final BlockState state) {
@@ -296,7 +303,7 @@ public final class RayTraceObfuscation {
      * Packs a position inside a chunk. Packed positions sort by y first, then z, then x, the order in which
      * {@link #hideSection} records them, so recorded arrays are sorted and can be binary searched.
      */
-    static int pack(final int y, final int relZ, final int relX) {
+    public static int pack(final int y, final int relZ, final int relX) {
         return y << 8 | relZ << 4 | relX;
     }
 
