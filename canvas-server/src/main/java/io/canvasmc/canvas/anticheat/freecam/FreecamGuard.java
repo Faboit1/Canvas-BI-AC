@@ -11,18 +11,27 @@ import io.canvasmc.canvas.anticheat.PlayerVisibility;
 import io.canvasmc.canvas.anticheat.VisibilityModule;
 import io.canvasmc.canvas.anticheat.disguise.ChunkRewrite;
 import io.canvasmc.canvas.anticheat.antixray.RayTraceAntiXray;
+import io.canvasmc.canvas.anticheat.antixray.RayTraceObfuscation;
+import io.canvasmc.canvas.anticheat.disguise.BlockDisguises;
+import io.papermc.paper.antixray.ChunkPacketBlockController;
 import io.canvasmc.canvas.anticheat.raytrace.OcclusionAccess;
 import io.canvasmc.canvas.anticheat.raytrace.VoxelRaycaster;
+import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
-import it.unimi.dsi.fastutil.shorts.ShortArraySet;
-import it.unimi.dsi.fastutil.shorts.ShortIterator;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.shorts.ShortArrayList;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.network.protocol.Packet;
-import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket;
@@ -32,11 +41,14 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.phys.AABB;
 import org.jspecify.annotations.Nullable;
 
@@ -64,8 +76,10 @@ import org.jspecify.annotations.Nullable;
  * are hidden even right next to the player, unless they can be seen. The camera box is only entered from the eyes,
  * so the start box sections stop being sent real as a whole. Inside it, where the player may dig, a second layer of
  * blocks is visible: the client shows what is behind a block as soon as it breaks it, that must never be filler.
- * Blocks that become visible are revealed by re-sending their chunk; a block opening up inside the camera box
- * reveals what it uncovers there in the same tick, a few opaque blocks as block updates instead. Updates of blocks
+ * Blocks that become visible are revealed with block updates, sent the way a chunk packet would send them, and with
+ * the light of the sections where they are lit; the chunk is only sent again when that would cost the client less
+ * (see {@link #revealBlocks}). A block opening up inside the camera box reveals what it uncovers there in the same
+ * tick. Updates of blocks
  * outside the camera box that can't currently be seen are withheld, the block counting as filler until the chunk is
  * re-sent, so a player that saw a place once doesn't keep receiving what happens there.
  * <p>
@@ -279,6 +293,37 @@ public final class FreecamGuard implements VisibilityModule {
          * Sections the client got real since the chunk was sent, which are never masked again (section mode).
          */
         long revealed;
+        /**
+         * Masked sections the client got with the biomes of the top section instead of their own.
+         */
+        long maskedBiomes;
+        /**
+         * Per-block mode: per section index, the blocks counted as filler because an update of them was withheld,
+         * which the client still has with an older state instead of filler, or {@code null} if there are none. Only
+         * used on the player's thread.
+         */
+        long @Nullable [] @Nullable [] stale;
+        /**
+         * The player's tick when a queued reveal of the chunk was first deferred, see {@link #revealBlocks}.
+         */
+        int deferredSince = NOT_DEFERRED;
+
+        void markStale(final int x, final int y, final int z) {
+            final int index = (y >> 4) - this.minSectionY;
+            final int sections = this.chunk.getSectionsCount();
+            if (index < 0 || index >= sections) {
+                return;
+            }
+            if (this.stale == null) {
+                this.stale = new long[sections][];
+            }
+            long[] bits = this.stale[index];
+            if (bits == null) {
+                this.stale[index] = bits = new long[CellVisibility.WORDS];
+            }
+            final int bit = (x & 15) | (z & 15) << 4 | (y & 15) << 8;
+            bits[bit >>> 6] |= 1L << bit;
+        }
 
         SentChunk(final LevelChunk chunk) {
             this.chunk = chunk;
@@ -1134,10 +1179,16 @@ public final class FreecamGuard implements VisibilityModule {
         return (int) (queued << 42 >> 42);
     }
 
+    /**
+     * Reveals queued chunks, nearest first: per-block mode sends what they show as block updates, at most
+     * {@link #MAX_REVEALED_BLOCKS_PER_TICK} blocks, and at most {@code limit} chunks are sent again per tick.
+     */
     private void processRevealQueue(final int limit) {
         final Pvs pvs = this.current;
-        int sentNow = 0;
-        while (this.revealQueueHead < this.revealQueueSize && sentNow < limit) {
+        int resent = 0;
+        int blocks = 0;
+        LongArrayList deferred = null;
+        while (this.revealQueueHead < this.revealQueueSize && resent < limit && blocks < MAX_REVEALED_BLOCKS_PER_TICK) {
             final long queued = this.revealQueue[this.revealQueueHead++];
             final int chunkX = unpackQueuedX(queued);
             final int chunkZ = unpackQueuedZ(queued);
@@ -1146,13 +1197,33 @@ public final class FreecamGuard implements VisibilityModule {
                 continue;
             }
             if (reveals(pvs, entry)) {
-                this.resend(entry);
-                ++sentNow;
+                final int revealed = this.perBlock ? this.revealBlocks(entry, false) : RESENT;
+                if (revealed == DEFERRED) {
+                    (deferred == null ? deferred = new LongArrayList() : deferred).add(queued);
+                    continue;
+                }
+                if (revealed >= 0) {
+                    blocks += revealed;
+                    continue;
+                }
+                if (!this.perBlock) {
+                    this.resend(entry);
+                }
+                ++resent;
             }
         }
         if (this.revealQueueHead >= this.revealQueueSize) {
             this.revealQueueHead = 0;
             this.revealQueueSize = 0;
+        }
+        if (deferred != null) {
+            // retried from the next tick on
+            for (int i = 0; i < deferred.size(); ++i) {
+                if (this.revealQueueSize == this.revealQueue.length) {
+                    this.revealQueue = Arrays.copyOf(this.revealQueue, this.revealQueue.length * 2);
+                }
+                this.revealQueue[this.revealQueueSize++] = deferred.getLong(i);
+            }
         }
     }
 
@@ -1521,6 +1592,9 @@ public final class FreecamGuard implements VisibilityModule {
             this.sent.put(key, entry);
         }
         entry.revealed |= ~masked;
+        entry.maskedBiomes = packet.getChunkData().canvas$maskedBiomes;
+        entry.stale = null;
+        entry.deferredSince = NOT_DEFERRED;
         this.setState(entry, masked, cells);
     }
 
@@ -1725,7 +1799,7 @@ public final class FreecamGuard implements VisibilityModule {
                 final int chunkZ = overlay.originZ + z;
                 final SentChunk entry = this.sent.get(CoordinateUtils.getChunkKey(chunkX, chunkZ));
                 if (entry != null && entry.chunk.getLevel() == overlay.level && entry.hidesAny()) {
-                    this.reveal(entry, overlay, chunkX, chunkZ);
+                    this.revealBlocks(entry, true);
                 }
             }
         }
@@ -1737,51 +1811,80 @@ public final class FreecamGuard implements VisibilityModule {
     private static final int MAX_OPENINGS_PER_TICK = 4;
 
     /**
-     * Most blocks to send as block updates instead of re-sending their chunk.
+     * Most blocks of one chunk revealed with block updates. A chunk with more to reveal is sent again, which then
+     * costs the client about as much as the updates would.
      */
-    private static final int MAX_REVEALED_BLOCKS = 128;
+    private static final int MAX_REVEALED_BLOCKS = 2 * 16 * 16 * 16;
+    /**
+     * Most blocks the reveal queue reveals with block updates per tick, besides the chunks it sends again.
+     */
+    private static final int MAX_REVEALED_BLOCKS_PER_TICK = 4 * 16 * 16 * 16;
+    /**
+     * Ticks a queued reveal waits at most for the packet of its chunk to be obfuscated, before the chunk is sent again
+     * instead. Obfuscation takes a tick or two, chunks are only that fresh right after a teleport or joining.
+     */
+    private static final int MAX_DEFER_TICKS = 20;
+    private static final int NOT_DEFERRED = Integer.MIN_VALUE;
+    private static final int RESENT = -1;
+    private static final int DEFERRED = -2;
+
+    private static final int[][] NEIGHBORS = {{-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
 
     /**
-     * Gives the client the blocks of a chunk the overlay shows that it has as filler. A few opaque blocks, like
-     * those uncovered by digging, are sent as block updates: digging must not re-send a chunk for every block, and
-     * the client must get them before it digs on. Anything else re-sends the chunk: see-through blocks need their
-     * light, and blocks anti-xray may disguise only get disguised in chunk packets.
+     * Gives the client the blocks of a sent chunk that the PVS or the overlay show and that it has as filler, as block
+     * updates instead of the whole chunk again. A chunk packet makes the client rebuild every section of the chunk and
+     * its eight neighbors (216 sections in a 24 section world) and replace all of the chunk's block entities, which
+     * stalls weaker clients when it happens a few times per second; block updates only rebuild the sections they
+     * change, and light is only sent for sections where revealed blocks are lit.
+     * <p>
+     * Blocks are sent like a chunk packet would send them: hidden by Paper's anti-xray while they aren't exposed,
+     * hidden by ray traced anti-xray until the player can see them, disguised by anti-bud and storage hiding. A
+     * revealed see-through block can expose blocks next to it that the client has hidden by anti-xray, those are
+     * sent again as well.
+     * <p>
+     * Sends the chunk again instead when block updates can't reproduce its packet (Paper's anti-xray in engine-mode 2
+     * or 3, the packet of the chunk still being obfuscated, biomes the client has from the top section that differ
+     * from the real ones) or would cost more than the packet.
+     *
+     * @param urgent whether the blocks must be revealed right now. Otherwise a reveal waiting for the packet of the
+     *               chunk to be obfuscated is deferred for a few ticks, instead of sending the chunk again
+     * @return the number of revealed blocks, {@link #RESENT} if the chunk was sent again instead, or
+     * {@link #DEFERRED}
      */
-    private void reveal(final SentChunk entry, final Overlay overlay, final int chunkX, final int chunkZ) {
+    private int revealBlocks(final SentChunk entry, final boolean urgent) {
         final LevelChunk chunk = entry.chunk;
-        final Level level = chunk.getLevel();
         final ServerPlayer player = this.owner.player;
-        final boolean disguised = !this.owner.bypassesAntiXray() && level.chunkPacketBlockController.shouldModify(player, chunk);
+        if (chunk.getLevel() != player.level()) {
+            // left over from the previous world, the client doesn't have it anymore
+            return 0;
+        }
+        final ServerLevel level = (ServerLevel) chunk.getLevel();
+        final int chunkX = chunk.getPos().x();
+        final int chunkZ = chunk.getPos().z();
         final int sections = chunk.getSectionsCount();
+        final Pvs pvs = this.current;
+        final int column = pvs == null || !pvs.perBlock || pvs.level != level ? -1 : pvs.column(chunkX, chunkZ);
+        final Overlay overlay = this.overlay;
+
         long[][] revealed = null;
         int count = 0;
-        for (int index = 0; index < sections && index < overlay.height; ++index) {
-            final long[] visible = overlay.visibleBlocks(level, chunkX, chunkZ, index);
+        for (int index = 0; index < sections; ++index) {
+            long[] visible = column >= 0 ? pvs.visibleBlocks(column, index) : null;
+            if (overlay != null) {
+                visible = union(visible, overlay.visibleBlocks(level, chunkX, chunkZ, index));
+            }
             final long[] real = entry.realBlocks(index);
             if (!showsMore(visible, real)) {
                 continue;
             }
-            if (real == null || visible == CellVisibility.EVERY_BLOCK) {
-                this.resend(entry);
-                return;
-            }
-            final LevelChunkSection section = chunk.getSections()[index];
             final long[] add = new long[CellVisibility.WORDS];
             for (int w = 0; w < CellVisibility.WORDS; ++w) {
-                add[w] = visible[w] & ~real[w];
+                add[w] = (visible == CellVisibility.EVERY_BLOCK ? -1L : visible[w]) & (real == null ? -1L : ~real[w]);
                 count += Long.bitCount(add[w]);
-                if (count > MAX_REVEALED_BLOCKS) {
-                    this.resend(entry);
-                    return;
-                }
-                for (long bits = add[w]; bits != 0L; bits &= bits - 1L) {
-                    final int bit = w << 6 | Long.numberOfTrailingZeros(bits);
-                    final BlockState state = section.getBlockState(bit & 15, bit >>> 8, (bit >>> 4) & 15);
-                    if (!state.isSolidRender() || (disguised && level.chunkPacketBlockController.canvas$mayObfuscate(level, state))) {
-                        this.resend(entry);
-                        return;
-                    }
-                }
+            }
+            if (count > MAX_REVEALED_BLOCKS) {
+                this.resend(entry);
+                return RESENT;
             }
             if (revealed == null) {
                 revealed = new long[sections][];
@@ -1789,71 +1892,404 @@ public final class FreecamGuard implements VisibilityModule {
             revealed[index] = add;
         }
         if (revealed == null) {
-            return;
+            return 0;
         }
 
-        // the client counts them as real first, so filtering the updates below doesn't withhold them
+        final ChunkPacketBlockController controller = level.chunkPacketBlockController;
+        final boolean antiXray = !this.owner.bypassesAntiXray() && controller.shouldModify(player, chunk);
+        final RayTraceObfuscation traced = antiXray ? RayTraceObfuscation.of(level) : null;
+        if (traced != null && this.owner.antiXray.isObfuscating(chunkX, chunkZ)) {
+            // which blocks the client has hidden by ray traced anti-xray isn't known yet
+            if (!urgent) {
+                if (entry.deferredSince == NOT_DEFERRED) {
+                    entry.deferredSince = player.tickCount;
+                }
+                if (player.tickCount - entry.deferredSince < MAX_DEFER_TICKS) {
+                    return DEFERRED;
+                }
+            }
+            this.resend(entry);
+            return RESENT;
+        }
+        if (antiXray && !controller.canvas$hidesLikeBlockUpdates() || !this.biomesMatch(entry, revealed)) {
+            this.resend(entry);
+            return RESENT;
+        }
+        entry.deferredSince = NOT_DEFERRED;
+
+        // the client counts them as real first: the per-player filters below must not take them for filler
         final long[][] old = entry.cells;
         final long[][] cells = old == null ? new long[sections][] : old.clone();
+        long masked = entry.masked;
         for (int index = 0; index < sections; ++index) {
             final long[] add = revealed[index];
             if (add == null) {
                 continue;
             }
-            final long[] merged = entry.realBlocks(index).clone();
+            final long[] real = entry.realBlocks(index);
+            final long[] merged = real == null ? add.clone() : real.clone();
             long all = -1L;
             for (int w = 0; w < CellVisibility.WORDS; ++w) {
                 all &= merged[w] |= add[w];
             }
             cells[index] = all == -1L ? null : merged;
+            masked &= ~(1L << index);
         }
         boolean any = false;
         for (final long[] section : cells) {
             any |= section != null;
         }
-        this.setState(entry, entry.masked, any ? cells : null);
+        this.setState(entry, masked, any ? cells : null);
 
+        final Reveal reveal = new Reveal(level, controller, antiXray, traced);
         for (int index = 0; index < sections; ++index) {
             final long[] add = revealed[index];
             if (add == null) {
                 continue;
             }
-            final SectionPos sectionPos = SectionPos.of(chunkX, chunk.getMinSectionY() + index, chunkZ);
-            final ShortArraySet positions = new ShortArraySet();
+            final LevelChunkSection section = chunk.getSections()[index];
+            final int sectionY = chunk.getMinSectionY() + index;
+            final BlockState filler = ChunkMasking.filler(level, sectionY);
+            final long[] stale = entry.stale == null ? null : entry.stale[index];
             for (int w = 0; w < CellVisibility.WORDS; ++w) {
                 for (long bits = add[w]; bits != 0L; bits &= bits - 1L) {
                     final int bit = w << 6 | Long.numberOfTrailingZeros(bits);
-                    // section relative position: x << 8 | z << 4 | y
-                    positions.add((short) ((bit & 15) << 8 | ((bit >>> 4) & 15) << 4 | bit >>> 8));
-                }
-            }
-            final LevelChunkSection section = chunk.getSections()[index];
-            final ClientboundSectionBlocksUpdatePacket packet = new ClientboundSectionBlocksUpdatePacket(sectionPos, positions, section)
-                .canvas$filter(this.owner);
-            // storage hiding withholds hidden storage, whose filler the client must get instead of this filler
-            for (final ShortIterator iterator = positions.iterator(); iterator.hasNext(); ) {
-                final short packed = iterator.nextShort();
-                final int x = sectionPos.relativeToBlockX(packed);
-                final int y = sectionPos.relativeToBlockY(packed);
-                final int z = sectionPos.relativeToBlockZ(packed);
-                if (this.owner.storage.isHiddenAt(x, y, z)) {
-                    final BlockState state = section.getBlockState(x & 15, y & 15, z & 15);
-                    player.connection.send(new ClientboundBlockUpdatePacket(new BlockPos(x, y, z), this.owner.hiddenStateOf((ServerLevel) level, x, y, z, state)));
-                }
-            }
-            if (packet == null) {
-                continue;
-            }
-            player.connection.send(packet);
-            packet.runUpdates((pos, state) -> {
-                if (state.hasBlockEntity()) {
-                    final BlockEntity blockEntity = level.getBlockEntity(pos);
-                    final Packet<?> update = blockEntity == null ? null : blockEntity.getUpdatePacket();
-                    if (update != null) {
-                        player.connection.send(update);
+                    final int x = chunkX << 4 | bit & 15;
+                    final int y = sectionY << 4 | bit >>> 8;
+                    final int z = chunkZ << 4 | (bit >>> 4) & 15;
+                    final BlockState state = section.getBlockState(bit & 15, bit >>> 8, (bit >>> 4) & 15);
+                    reveal.done(x, y, z);
+                    final BlockState send = this.packetState(reveal, x, y, z, state);
+                    // the client has filler there, unless it kept an older state of a withheld update
+                    if (send != filler || stale != null && (stale[w] >>> bit & 1L) != 0L) {
+                        reveal.change(chunk, x, y, z, send, send == state);
                     }
                 }
-            });
+                if (stale != null) {
+                    stale[w] &= ~add[w];
+                }
+            }
+        }
+        if (antiXray) {
+            // revealed see-through blocks expose the blocks next to them
+            for (int index = 0; index < sections; ++index) {
+                final long[] add = revealed[index];
+                if (add == null) {
+                    continue;
+                }
+                final LevelChunkSection section = chunk.getSections()[index];
+                final int sectionY = chunk.getMinSectionY() + index;
+                for (int w = 0; w < CellVisibility.WORDS; ++w) {
+                    for (long bits = add[w]; bits != 0L; bits &= bits - 1L) {
+                        final int bit = w << 6 | Long.numberOfTrailingZeros(bits);
+                        if (controller.canvas$isSolid(section.getBlockState(bit & 15, bit >>> 8, (bit >>> 4) & 15))) {
+                            continue;
+                        }
+                        final int x = chunkX << 4 | bit & 15;
+                        final int y = sectionY << 4 | bit >>> 8;
+                        final int z = chunkZ << 4 | (bit >>> 4) & 15;
+                        for (final int[] offset : NEIGHBORS) {
+                            this.exposeNeighbor(reveal, x + offset[0], y + offset[1], z + offset[2]);
+                        }
+                    }
+                }
+            }
+        }
+        reveal.registerHidden(this.owner.antiXray);
+        reveal.send(player);
+        this.sendRevealedLight(chunk, revealed);
+        return count;
+    }
+
+    /**
+     * Whether the biomes of the sections around revealed blocks are real on the client, or the same as the biomes of
+     * the top section that masked sections far from anything visible are sent with. Only the sections of the chunk
+     * itself are checked, the client blends biomes over a few blocks only.
+     */
+    private boolean biomesMatch(final SentChunk entry, final long[][] revealed) {
+        final long maskedBiomes = entry.maskedBiomes;
+        if (maskedBiomes == 0L) {
+            return true;
+        }
+        final LevelChunkSection[] sections = entry.chunk.getSections();
+        final LevelChunkSection top = sections[sections.length - 1];
+        for (int index = 0; index < revealed.length; ++index) {
+            if (revealed[index] == null) {
+                continue;
+            }
+            for (int near = Math.max(0, index - 1); near <= Math.min(sections.length - 1, index + 1); ++near) {
+                if ((maskedBiomes >>> near & 1L) != 0L && !sameBiomes(sections[near], top)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean sameBiomes(final LevelChunkSection a, final LevelChunkSection b) {
+        if (a == b) {
+            return true;
+        }
+        for (int y = 0; y < 4; ++y) {
+            for (int z = 0; z < 4; ++z) {
+                for (int x = 0; x < 4; ++x) {
+                    if (!a.getNoiseBiome(x, y, z).equals(b.getNoiseBiome(x, y, z))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The state a chunk packet would give the client for a block it has real from now on: hidden by Paper's
+     * anti-xray if it isn't exposed, hidden by ray traced anti-xray until it is seen, otherwise as any block update
+     * would send it to this player.
+     */
+    private BlockState packetState(final Reveal reveal, final int x, final int y, final int z, final BlockState state) {
+        if (reveal.antiXray && reveal.controller.canvas$mayObfuscate(reveal.level, state)) {
+            final BlockState hide = reveal.controller.canvas$hideState(reveal.level, y);
+            if (hide != null) {
+                if (!this.isExposed(reveal, x, y, z)) {
+                    return hide;
+                }
+                if (reveal.traced != null && reveal.traced.isTraced(state)) {
+                    final int tracked = this.owner.antiXray.trackedAt(x, y, z);
+                    if (tracked == RayTraceAntiXray.HIDDEN || tracked != RayTraceAntiXray.REAL && reveal.hide(this.owner.antiXray, x, y, z)) {
+                        return hide;
+                    }
+                }
+            }
+        }
+        if (this.owner.isBlockHidden(x, y, z, state)) {
+            return this.owner.hiddenStateOf(reveal.level, x, y, z, state);
+        }
+        return this.owner.disguiseBlock(x, y, z, state);
+    }
+
+    /**
+     * Whether a neighbor of the block lets the client see it: it is real on the client and not solid for Paper's
+     * anti-xray. Filler hides what is next to it; blocks in chunks the client doesn't have, or that belong to
+     * another region, count as exposing, like Paper treats missing neighbors.
+     */
+    private boolean isExposed(final Reveal reveal, final int x, final int y, final int z) {
+        for (final int[] offset : NEIGHBORS) {
+            final int nx = x + offset[0];
+            final int ny = y + offset[1];
+            final int nz = z + offset[2];
+            if (ny < reveal.level.getMinY() || ny > reveal.level.getMaxY()) {
+                return true;
+            }
+            final SentChunk entry = this.sent.get(CoordinateUtils.getChunkKey(nx >> 4, nz >> 4));
+            if (entry == null || entry.chunk.getLevel() != reveal.level || !TickThread.isTickThreadFor(reveal.level, nx >> 4, nz >> 4)) {
+                return true;
+            }
+            if (!entry.hidesBlock(nx, ny, nz) && !reveal.controller.canvas$isSolid(entry.chunk.getBlockState(nx, ny, nz))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Sends a block the client has real again if anti-xray may have hidden it in a chunk packet and a revealed
+     * see-through block next to it exposes it now. If the player can't see it right now, it counts as filler
+     * instead and is sent once it may be visible, like any withheld update.
+     */
+    private void exposeNeighbor(final Reveal reveal, final int x, final int y, final int z) {
+        if (y < reveal.level.getMinY() || y > reveal.level.getMaxY() || !reveal.done(x, y, z)) {
+            return;
+        }
+        final SentChunk entry = this.sent.get(CoordinateUtils.getChunkKey(x >> 4, z >> 4));
+        if (entry == null || entry.chunk.getLevel() != reveal.level || entry.hidesBlock(x, y, z)
+            || !TickThread.isTickThreadFor(reveal.level, x >> 4, z >> 4)) {
+            return;
+        }
+        final BlockState state = entry.chunk.getBlockState(x, y, z);
+        if (!reveal.controller.canvas$mayObfuscate(reveal.level, state) || reveal.controller.canvas$hideState(reveal.level, y) == null) {
+            return;
+        }
+        final int tracked = this.owner.antiXray.trackedAt(x, y, z);
+        if (tracked == RayTraceAntiXray.HIDDEN || tracked == RayTraceAntiXray.PENDING) {
+            // the client has it hidden until the ray tracing reveals it, or its chunk packet decides
+            return;
+        }
+        if (this.withholdsUpdate(x, y, z)) {
+            return;
+        }
+        final BlockState send = this.packetState(reveal, x, y, z, state);
+        reveal.change(entry.chunk, x, y, z, send, send == state);
+    }
+
+    /**
+     * Sends the light of the sections where revealed blocks are lit: the client has every block it had as filler
+     * dark, so revealed blocks that are dark anyway (most of the underground) need no light update.
+     */
+    private void sendRevealedLight(final LevelChunk chunk, final long[][] revealed) {
+        final ServerLevel level = (ServerLevel) chunk.getLevel();
+        final LevelLightEngine light = level.getLightEngine();
+        BitSet sky = null;
+        BitSet block = null;
+        for (int index = 0; index < revealed.length; ++index) {
+            final long[] add = revealed[index];
+            if (add == null) {
+                continue;
+            }
+            final SectionPos pos = SectionPos.of(chunk.getPos(), chunk.getMinSectionY() + index);
+            // light sections start one below the world
+            if (isLit(light.getLayerListener(LightLayer.SKY).getDataLayerData(pos), add)) {
+                (sky == null ? sky = new BitSet() : sky).set(index + 1);
+            }
+            if (isLit(light.getLayerListener(LightLayer.BLOCK).getDataLayerData(pos), add)) {
+                (block == null ? block = new BitSet() : block).set(index + 1);
+            }
+        }
+        if (sky == null && block == null) {
+            return;
+        }
+        final ClientboundLightUpdatePacket packet = new ClientboundLightUpdatePacket(chunk.getPos(), light, sky == null ? new BitSet() : sky,
+            block == null ? new BitSet() : block);
+        final ClientboundLightUpdatePacket filtered = this.owner.filterLightUpdate(packet, BlockDisguises.scan(level, packet));
+        if (filtered != null) {
+            this.owner.player.connection.send(filtered);
+        }
+    }
+
+    /**
+     * Whether any of the given blocks has light in the layer. Nibbles are indexed like the blocks.
+     */
+    private static boolean isLit(final @Nullable DataLayer layer, final long[] blocks) {
+        if (layer == null || layer.isEmpty()) {
+            return false;
+        }
+        final byte[] data = layer.getData();
+        for (int w = 0; w < CellVisibility.WORDS; ++w) {
+            for (long bits = blocks[w]; bits != 0L; bits &= bits - 1L) {
+                final int bit = w << 6 | Long.numberOfTrailingZeros(bits);
+                if ((data[bit >>> 1] >>> ((bit & 1) << 2) & 15) != 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The block updates of one reveal, collected per section and sent at once.
+     */
+    private static final class Reveal {
+        final ServerLevel level;
+        final ChunkPacketBlockController controller;
+        final boolean antiXray;
+        final @Nullable RayTraceObfuscation traced;
+        /**
+         * Positions decided already, so a block next to several revealed blocks is only looked at once.
+         */
+        private final LongOpenHashSet done = new LongOpenHashSet();
+        private final Long2ObjectLinkedOpenHashMap<SectionChanges> changes = new Long2ObjectLinkedOpenHashMap<>();
+        private final List<BlockPos> blockEntities = new ArrayList<>();
+        /**
+         * Per chunk, traced blocks sent hidden that ray traced anti-xray must track from now on.
+         */
+        private @Nullable Long2ObjectMap<HiddenBlocks> hidden;
+
+        Reveal(final ServerLevel level, final ChunkPacketBlockController controller, final boolean antiXray, final @Nullable RayTraceObfuscation traced) {
+            this.level = level;
+            this.controller = controller;
+            this.antiXray = antiXray;
+            this.traced = traced;
+        }
+
+        /**
+         * @return whether the position wasn't decided yet, marking it decided
+         */
+        boolean done(final int x, final int y, final int z) {
+            return this.done.add(BlockPos.asLong(x, y, z));
+        }
+
+        void change(final LevelChunk chunk, final int x, final int y, final int z, final BlockState state, final boolean real) {
+            final long key = SectionPos.asLong(x >> 4, y >> 4, z >> 4);
+            SectionChanges section = this.changes.get(key);
+            if (section == null) {
+                this.changes.put(key, section = new SectionChanges());
+            }
+            section.positions.add((short) ((x & 15) << 8 | (z & 15) << 4 | y & 15));
+            section.states.add(state);
+            if (real && state.hasBlockEntity()) {
+                this.blockEntities.add(new BlockPos(x, y, z));
+            }
+        }
+
+        /**
+         * Records a traced block to send hidden, unless the chunk hides as many as a chunk packet would already.
+         *
+         * @return whether the block is sent hidden
+         */
+        boolean hide(final RayTraceAntiXray antiXray, final int x, final int y, final int z) {
+            if (this.hidden == null) {
+                this.hidden = new Long2ObjectOpenHashMap<>();
+            }
+            final long key = CoordinateUtils.getChunkKey(x >> 4, z >> 4);
+            HiddenBlocks blocks = this.hidden.get(key);
+            if (blocks == null) {
+                final LevelChunk chunk = this.level.getChunkIfLoaded(x >> 4, z >> 4);
+                if (chunk == null) {
+                    return false;
+                }
+                this.hidden.put(key, blocks = new HiddenBlocks(chunk, antiXray.hideCapacity(chunk, this.traced)));
+            }
+            if (blocks.count >= blocks.capacity) {
+                return false;
+            }
+            if (blocks.count == blocks.positions.length) {
+                blocks.positions = Arrays.copyOf(blocks.positions, Math.max(16, blocks.count * 2));
+            }
+            blocks.positions[blocks.count++] = RayTraceObfuscation.pack(y, z & 15, x & 15);
+            return true;
+        }
+
+        void registerHidden(final RayTraceAntiXray antiXray) {
+            if (this.hidden == null || this.traced == null) {
+                return;
+            }
+            for (final HiddenBlocks blocks : this.hidden.values()) {
+                antiXray.hide(blocks.chunk, this.traced, blocks.positions, blocks.count);
+            }
+        }
+
+        void send(final ServerPlayer player) {
+            for (final Long2ObjectMap.Entry<SectionChanges> entry : this.changes.long2ObjectEntrySet()) {
+                final SectionChanges section = entry.getValue();
+                player.connection.send(new ClientboundSectionBlocksUpdatePacket(SectionPos.of(entry.getLongKey()), section.positions.toShortArray(),
+                    section.states.toArray(new BlockState[0])));
+            }
+            for (final BlockPos pos : this.blockEntities) {
+                final BlockEntity blockEntity = this.level.getBlockEntity(pos);
+                if (blockEntity == null) {
+                    continue;
+                }
+                // what a chunk packet has for every block entity, also for those without update packets (chests)
+                final Packet<?> update = blockEntity.getUpdatePacket();
+                player.connection.send(update != null ? update : ClientboundBlockEntityDataPacket.create(blockEntity));
+            }
+        }
+
+        private static final class SectionChanges {
+            final ShortArrayList positions = new ShortArrayList();
+            final List<BlockState> states = new ArrayList<>();
+        }
+
+        private static final class HiddenBlocks {
+            final LevelChunk chunk;
+            final int capacity;
+            int[] positions = new int[16];
+            int count;
+
+            HiddenBlocks(final LevelChunk chunk, final int capacity) {
+                this.chunk = chunk;
+                this.capacity = capacity;
+            }
         }
     }
 
@@ -2127,6 +2563,7 @@ public final class FreecamGuard implements VisibilityModule {
             return false;
         }
         this.setBlock(entry, x, y, z, false);
+        entry.markStale(x, y, z);
         return true;
     }
 

@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Faboit1 <omarassayed3@gmail.com>
+Date: Sat, 7 Nov 2026 15:39:58 +0000
+Subject: [PATCH] Entity Tracking Optimizations
+
+Lazy tracking keeps an entity visible to a player that already sees it a
+few blocks beyond the tracking range. Movement LOD sends movement and head
+rotation of entities less often to players far from them, adding the
+skipped moves up exactly.
+
+diff --git a/net/minecraft/network/protocol/game/ClientboundMoveEntityPacket.java b/net/minecraft/network/protocol/game/ClientboundMoveEntityPacket.java
+index e01db54392a072f7ea5da9a07f45bf567ad46c51..6c3213c50fd4802077bb78ee203885edf05bee56 100644
+--- a/net/minecraft/network/protocol/game/ClientboundMoveEntityPacket.java
++++ b/net/minecraft/network/protocol/game/ClientboundMoveEntityPacket.java
+@@ -91,6 +91,16 @@ public abstract class ClientboundMoveEntityPacket implements Packet<ClientGamePa
+         return this.onGround;
+     }
+ 
++    // Canvas start - entity movement LOD
++    public byte canvas$yRot() {
++        return this.yRot;
++    }
++
++    public byte canvas$xRot() {
++        return this.xRot;
++    }
++    // Canvas end - entity movement LOD
++
+     public static class Pos extends ClientboundMoveEntityPacket {
+         public static final StreamCodec<FriendlyByteBuf, ClientboundMoveEntityPacket.Pos> STREAM_CODEC = Packet.codec(
+             ClientboundMoveEntityPacket.Pos::write, ClientboundMoveEntityPacket.Pos::read
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 7dbd6d8abcef90ccff9a7383d2fbb7ef1ab39ce5..051a143704a836c3a4b5a1b058a78b904519099e 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1080,6 +1080,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                     || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkStatus().isOrAfter(FullChunkStatus.ENTITY_TICKING)) {
+                     tracker.serverEntity.sendChanges();
+                 }
++                tracker.canvas$movementLod.tick(tracker.seenBy); // Canvas - entity movement LOD
+             }
+         } finally {
+             worldData.iteratingTrackerEntities = false; // Folia - region threading
+@@ -1211,6 +1212,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+         private final int range;
+         private SectionPos lastSectionPos;
+         public final Set<ServerPlayerConnection> seenBy = new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>(); // Paper - Perf: optimise map impl
++        public final io.canvasmc.canvas.world.MovementLod canvas$movementLod; // Canvas - entity movement LOD
+ 
+         // Paper start - optimise entity tracker
+         private long lastChunkUpdate = -1L;
+@@ -1297,6 +1299,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+         public TrackedEntity(final Entity entity, final int range, final int updateInterval, final boolean trackDelta) {
+             this.serverEntity = new ServerEntity(ChunkMap.this.level, entity, updateInterval, trackDelta, this, this.seenBy); // Paper
++            this.canvas$movementLod = new io.canvasmc.canvas.world.MovementLod(entity, this.serverEntity); // Canvas - entity movement LOD
+             this.entity = entity;
+             this.range = range;
+             this.lastSectionPos = SectionPos.of(entity);
+@@ -1314,6 +1317,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+         @Override
+         public void sendToTrackingPlayers(final Packet<? super ClientGamePacketListener> packet) {
++            if (this.canvas$movementLod.send(this.seenBy, packet, null)) return; // Canvas - entity movement LOD
+             for (ServerPlayerConnection connection : this.seenBy) {
+                 connection.send(packet);
+             }
+@@ -1329,6 +1333,7 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+         @Override
+         public void sendToTrackingPlayersFiltered(final Packet<? super ClientGamePacketListener> packet, final Predicate<ServerPlayer> targetPredicate) {
++            if (this.canvas$movementLod.send(this.seenBy, packet, targetPredicate)) return; // Canvas - entity movement LOD
+             for (ServerPlayerConnection connection : this.seenBy) {
+                 if (targetPredicate.test(connection.getPlayer())) {
+                     connection.send(packet);
+@@ -1340,11 +1345,13 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             for (ServerPlayerConnection connection : this.seenBy) {
+                 this.serverEntity.removePairing(connection.getPlayer());
+             }
++            this.canvas$movementLod.clear(); // Canvas - entity movement LOD
+         }
+ 
+         public void removePlayer(final ServerPlayer player) {
+             org.spigotmc.AsyncCatcher.catchOp("player tracker clear"); // Spigot
+             if (this.seenBy.remove(player.connection)) {
++                this.canvas$movementLod.remove(player.connection); // Canvas - entity movement LOD
+                 this.serverEntity.removePairing(player);
+                 if (this.seenBy.isEmpty()) {
+                     ChunkMap.this.level.debugSynchronizers().dropEntity(this.entity);
+@@ -1364,12 +1371,25 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+                 double visibleRange = Math.min(this.getEffectiveRange(), playerViewDistance * 16);
+                 double distanceSquared = deltaToPlayerX * deltaToPlayerX + deltaToPlayerZ * deltaToPlayerZ; // Paper
+                 double rangeSquared = visibleRange * visibleRange;
++                // Canvas start - lazy tracking
++                final int canvas$lazyRange = io.canvasmc.canvas.GlobalConfiguration.getInstance().entityTracking.lazyTrackingRange;
++                if (canvas$lazyRange > 0 && distanceSquared > rangeSquared && this.seenBy.contains(player.connection)) {
++                    // a player that sees the entity keeps seeing it a little beyond the range
++                    final double canvas$lazyRangeBlocks = visibleRange + canvas$lazyRange;
++                    rangeSquared = canvas$lazyRangeBlocks * canvas$lazyRangeBlocks;
++                }
++                // Canvas end - lazy tracking
+                 // Paper start - Configurable entity tracking range by Y
+                 boolean visibleToPlayer = distanceSquared <= rangeSquared && (!(this.entity instanceof net.minecraft.server.level.ServerPlayer) || !level.canvasConfig().visuals.dontTrackPlayersInEntityTracking); // Canvas - allow disabling player viewing eachother in worlds
+                 if (visibleToPlayer && level.paperConfig().entities.trackingRangeY.enabled) {
+                     double rangeY = level.paperConfig().entities.trackingRangeY.get(this.entity, -1);
+                     if (rangeY != -1) {
+                         double deltaToPlayerY = player.getY() - this.entity.getY();
++                        // Canvas start - lazy tracking
++                        if (canvas$lazyRange > 0 && deltaToPlayerY * deltaToPlayerY > rangeY * rangeY && this.seenBy.contains(player.connection)) {
++                            rangeY += canvas$lazyRange;
++                        }
++                        // Canvas end - lazy tracking
+                         visibleToPlayer = deltaToPlayerY * deltaToPlayerY <= rangeY * rangeY;
+                     }
+                 }
+diff --git a/net/minecraft/server/level/ServerEntity.java b/net/minecraft/server/level/ServerEntity.java
+index cda2dc6eca209b238244e115a7c62fabda2b3e76..31ee296497cfb8653350ab59a42fff39ab245c17 100644
+--- a/net/minecraft/server/level/ServerEntity.java
++++ b/net/minecraft/server/level/ServerEntity.java
+@@ -59,6 +59,14 @@ public class ServerEntity {
+     private final boolean trackDelta;
+     private final ServerEntity.Synchronizer synchronizer;
+     private final VecDeltaCodec positionCodec = new VecDeltaCodec();
++    // Canvas start - entity movement LOD
++    /**
++     * Where the relative moves sent so far put the entity on the client.
++     */
++    public Vec3 canvas$positionBase() {
++        return this.positionCodec.getBase();
++    }
++    // Canvas end - entity movement LOD
+     private byte lastSentYRot;
+     private byte lastSentXRot;
+     private byte lastSentYHeadRot;

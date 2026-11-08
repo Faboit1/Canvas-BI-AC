@@ -669,6 +669,58 @@ public class GlobalConfiguration extends Part {
         public boolean closeDesyncedMenus = true;
     }
 
+    public EntityTracking entityTracking = new EntityTracking();
+    public static class EntityTracking extends Part {
+
+        {
+            option("lazyTrackingRange")
+                .docs(
+                    "Blocks beyond the tracking range an entity a player already sees stays visible to them, so an",
+                    "entity moving back and forth along the edge of the tracking range isn't removed and sent again",
+                    "every few ticks. 0 turns this off"
+                ).greaterThanOrEqualTo(0.0F);
+            option("movementLod")
+                .docs(
+                    "Sends movement and head rotation of entities less often to players far from them, where it is",
+                    "hard to see. Skipped movement is added up exactly and sent with the next update, or once the",
+                    "interval is up, so no player is left with a wrong position"
+                );
+        }
+
+        public int lazyTrackingRange = 4;
+
+        public MovementLod movementLod = new MovementLod();
+        public static class MovementLod extends Part {
+
+            {
+                option("enabled").docs("Whether far entities get fewer movement updates");
+                option("startAtPlayers").docs("Only applies in regions with at least this many players").greaterThan(0.0F);
+                option("fullRateDistance").docs("Players closer than this many blocks get every update").greaterThanOrEqualTo(0.0F);
+                option("interval").docs("Ticks between updates for players beyond full-rate-distance").greaterThan(0.0F);
+                option("farDistance").docs("Players beyond this many blocks get updates every far-interval ticks").greaterThanOrEqualTo(0.0F);
+                option("farInterval").docs("Ticks between updates for players beyond far-distance").greaterThan(0.0F);
+            }
+
+            public boolean enabled = true;
+            public int startAtPlayers = 40;
+            // players are sent every 2 ticks and most mobs every 3, so slower intervals are what saves packets
+            public double fullRateDistance = 16.0;
+            public int interval = 4;
+            public double farDistance = 48.0;
+            public int farInterval = 8;
+
+            /**
+             * @return ticks between updates for a player at the given squared horizontal distance, 1 for every update
+             */
+            public int intervalFor(final double distanceSquared) {
+                if (distanceSquared < this.fullRateDistance * this.fullRateDistance) {
+                    return 1;
+                }
+                return distanceSquared < this.farDistance * this.farDistance ? this.interval : Math.max(this.interval, this.farInterval);
+            }
+        }
+    }
+
     public PurpurContainers purpurContainers = new PurpurContainers();
     public static class PurpurContainers extends Part {
 

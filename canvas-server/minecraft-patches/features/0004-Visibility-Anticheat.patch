@@ -170,10 +170,10 @@ index a189f5d3ca1b2ba65c3520ab4f71c0415830dd0d..bb41a4fe50ef6c5a893af0766e445ba4
      // Paper end - Optimize network
  }
 diff --git a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-index fbfaff3bb36d8c594a549cb2eb19b30a58cbcf60..b68481686164ae9ff70b7231503d941f82ac535d 100644
+index fbfaff3bb36d8c594a549cb2eb19b30a58cbcf60..b62dd423045d3344a89e8815d16cd57d54c4111b 100644
 --- a/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
 +++ b/net/minecraft/network/protocol/game/ClientboundLevelChunkPacketData.java
-@@ -40,6 +40,39 @@ public class ClientboundLevelChunkPacketData {
+@@ -40,6 +40,44 @@ public class ClientboundLevelChunkPacketData {
          return this.extraPackets;
      }
      // Paper end - Handle oversized block entities in chunks
@@ -209,11 +209,16 @@ index fbfaff3bb36d8c594a549cb2eb19b30a58cbcf60..b68481686164ae9ff70b7231503d941f
 +     * partly as filler, {@code null} for sections that weren't. {@code null} if no section was.
 +     */
 +    public final long @Nullable [] @Nullable [] canvas$visibleCells;
++    /**
++     * Bit set of the masked chunk section indexes that were written with the biomes of the top section instead of
++     * their own.
++     */
++    public final long canvas$maskedBiomes;
 +    // Canvas end - visibility anticheat - anti-freecam
  
      @Deprecated @io.papermc.paper.annotation.DoNotUse // Paper - Anti-Xray - Add chunk packet info
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk) {
-@@ -48,20 +81,54 @@ public class ClientboundLevelChunkPacketData {
+@@ -48,20 +86,55 @@ public class ClientboundLevelChunkPacketData {
      }
      public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
          // Paper end - Anti-Xray - Add chunk packet info
@@ -246,6 +251,7 @@ index fbfaff3bb36d8c594a549cb2eb19b30a58cbcf60..b68481686164ae9ff70b7231503d941f
 +    public ClientboundLevelChunkPacketData(final LevelChunk levelChunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo, final long maskedSections, final long @Nullable [] @Nullable [] visibleCells, final long maskedBiomes, final io.canvasmc.canvas.anticheat.disguise.@Nullable ChunkRewrite disguises) {
 +        this.canvas$maskedSections = maskedSections;
 +        this.canvas$visibleCells = visibleCells;
++        this.canvas$maskedBiomes = maskedBiomes;
 +        final io.canvasmc.canvas.anticheat.freecam.ChunkMasking.@Nullable MaskedBlocks[] maskedBlocks = maskBlocks(levelChunk, maskedSections, visibleCells, disguises);
 +        // Canvas end - visibility anticheat - anti-freecam
 +        this.canvas$chunkPacketInfo = chunkPacketInfo; // Canvas - visibility anticheat
@@ -270,7 +276,7 @@ index fbfaff3bb36d8c594a549cb2eb19b30a58cbcf60..b68481686164ae9ff70b7231503d941f
              // Paper start - Handle oversized block entities in chunks
              if (++totalTileEntities > BLOCK_ENTITY_LIMIT) {
                  net.minecraft.network.protocol.Packet<ClientGamePacketListener> packet = blockEntity.getUpdatePacket(); // Canvas - optimize block entity fetching
-@@ -85,6 +152,11 @@ public class ClientboundLevelChunkPacketData {
+@@ -85,6 +158,12 @@ public class ClientboundLevelChunkPacketData {
          this.buffer = new byte[size];
          input.readBytes(this.buffer);
          this.blockEntitiesData = ClientboundLevelChunkPacketData.BlockEntityInfo.LIST_STREAM_CODEC.decode(input);
@@ -278,11 +284,12 @@ index fbfaff3bb36d8c594a549cb2eb19b30a58cbcf60..b68481686164ae9ff70b7231503d941f
 +        // Canvas start - visibility anticheat - anti-freecam
 +        this.canvas$maskedSections = 0L;
 +        this.canvas$visibleCells = null;
++        this.canvas$maskedBiomes = 0L;
 +        // Canvas end - visibility anticheat - anti-freecam
      }
  
      public void write(final RegistryFriendlyByteBuf output) {
-@@ -94,12 +166,44 @@ public class ClientboundLevelChunkPacketData {
+@@ -94,12 +173,44 @@ public class ClientboundLevelChunkPacketData {
          ClientboundLevelChunkPacketData.BlockEntityInfo.LIST_STREAM_CODEC.encode(output, this.blockEntitiesData);
      }
  
@@ -330,7 +337,7 @@ index fbfaff3bb36d8c594a549cb2eb19b30a58cbcf60..b68481686164ae9ff70b7231503d941f
  
          return total;
      }
-@@ -116,8 +220,23 @@ public class ClientboundLevelChunkPacketData {
+@@ -116,8 +227,23 @@ public class ClientboundLevelChunkPacketData {
          extractChunkData(buffer, chunk, null);
      }
      public static void extractChunkData(final FriendlyByteBuf buffer, final LevelChunk chunk, final io.papermc.paper.antixray.ChunkPacketInfo<net.minecraft.world.level.block.state.BlockState> chunkPacketInfo) {
@@ -475,15 +482,18 @@ index a6971411d035f1fd759c8348320c6b43d65ce957..b87e1d4f588bc6451465688c1c1012d1
          this.skyYMask = input.readBitSet();
          this.blockYMask = input.readBitSet();
 diff --git a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..963d6f923070fe740ee4d41c9408942149fe6785 100644
+index a66d8fe21b7c162340ea2f6ac0b02de6093ad3b8..6cf426e1f32e44e027ce2324289a6ce657a5381e 100644
 --- a/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
 +++ b/net/minecraft/network/protocol/game/ClientboundSectionBlocksUpdatePacket.java
-@@ -48,6 +48,73 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
+@@ -48,6 +48,76 @@ public class ClientboundSectionBlocksUpdatePacket implements Packet<ClientGamePa
          this.states = blockChanges.values().toArray(new BlockState[0]);
      }
      // Paper end - Multi Block Change API
 +    // Canvas start - visibility anticheat
-+    private ClientboundSectionBlocksUpdatePacket(final SectionPos sectionPos, final short[] positions, final BlockState[] states) {
++    /**
++     * @param positions section relative positions ({@code x << 8 | z << 4 | y}), each state at the same index
++     */
++    public ClientboundSectionBlocksUpdatePacket(final SectionPos sectionPos, final short[] positions, final BlockState[] states) {
 +        this.sectionPos = sectionPos;
 +        this.positions = positions;
 +        this.states = states;
